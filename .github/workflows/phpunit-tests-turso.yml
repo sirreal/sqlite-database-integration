@@ -123,6 +123,19 @@ jobs:
           ignore-cache: "yes"
           composer-options: "--optimize-autoloader"
 
+      - name: Diagnose PHPUnit startup under Turso
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.turso-lib.outputs.path }}
+        working-directory: packages/mysql-on-sqlite
+        run: |
+          echo '--- phpunit --version ---'
+          php ./vendor/bin/phpunit --version; echo "exit=$?"
+          echo '--- phpunit --list-tests (first 5 lines) ---'
+          php ./vendor/bin/phpunit -c ./phpunit.xml.dist --list-tests 2>&1 | head -5; echo "exit=${PIPESTATUS[0]}"
+          echo '--- standalone bootstrap ---'
+          php -r 'require __DIR__ . "/tests/bootstrap.php"; echo "bootstrap ok\n";'; echo "exit=$?"
+
       - name: Run PHPUnit tests against Turso DB
         continue-on-error: true
         env:
