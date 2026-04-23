@@ -1,0 +1,91 @@
+name: PHPUnit Tests (Turso DB)
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+# The test suite is run against Turso DB (https://github.com/tursodatabase/turso),
+# a Rust reimplementation of SQLite. Turso is still in beta and its SQLite C API
+# is only partially implemented; failing tests are expected and the job is purely
+# informational. It tracks compatibility progress over time.
+jobs:
+  test:
+    name: PHP 8.5 / Turso DB (latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Determine latest Turso release
+        id: turso
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(gh release view --repo tursodatabase/turso --json tagName --jq .tagName)
+          echo "Using Turso release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Turso build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            turso/target
+          key: turso-${{ runner.os }}-${{ steps.turso.outputs.tag }}
+
+      - name: Clone Turso source
+        run: git clone --depth 1 --branch '${{ steps.turso.outputs.tag }}' https://github.com/tursodatabase/turso.git
+
+      - name: Build turso_sqlite3 shared library
+        working-directory: turso
+        run: cargo build --release -p turso_sqlite3
+
+      - name: Verify Turso shared library exposes SQLite3 C API
+        id: turso-lib
+        run: |
+          LIB="$GITHUB_WORKSPACE/turso/target/release/libturso_sqlite3.so"
+          test -f "$LIB"
+          echo "Library: $LIB"
+          echo "path=$LIB" >> "$GITHUB_OUTPUT"
+          echo '--- Sample of exported sqlite3_* symbols ---'
+          nm -D --defined-only "$LIB" | awk '$3 ~ /^sqlite3_/ {print $3}' | sort | head -20
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          tools: phpunit-polyfills
+
+      - name: Report SQLite version via Turso preload
+        env:
+          LD_PRELOAD: ${{ steps.turso-lib.outputs.path }}
+        run: |
+          php -r "echo 'Turso sqlite_version(): ' . (new PDO('sqlite::memory:'))->query('SELECT sqlite_version()')->fetch()[0] . PHP_EOL;"
+
+      - name: Install Composer dependencies (root)
+        uses: ramsey/composer-install@v3
+        with:
+          ignore-cache: "yes"
+          composer-options: "--optimize-autoloader"
+
+      - name: Install Composer dependencies (mysql-on-sqlite)
+        uses: ramsey/composer-install@v3
+        with:
+          working-directory: packages/mysql-on-sqlite
+          ignore-cache: "yes"
+          composer-options: "--optimize-autoloader"
+
+      - name: Run PHPUnit tests against Turso DB
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.turso-lib.outputs.path }}
+        working-directory: packages/mysql-on-sqlite
+        run: php ./vendor/bin/phpunit -c ./phpunit.xml.dist
