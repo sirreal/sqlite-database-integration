@@ -127,6 +127,11 @@ jobs:
         id: shim
         run: |
           cat > /tmp/turso-compat-shim.c <<'C'
+          #include <stdio.h>
+          #include <stdarg.h>
+          #include <stdlib.h>
+          #include <string.h>
+
           typedef struct sqlite3 sqlite3;
           typedef struct sqlite3_stmt sqlite3_stmt;
           typedef struct sqlite3_value sqlite3_value;
@@ -175,6 +180,46 @@ jobs:
 
           extern void sqlite3_result_int64(sqlite3_context *ctx, long long v);
           void sqlite3_result_int(sqlite3_context *ctx, int v) { sqlite3_result_int64(ctx, (long long)v); }
+
+          // SQLite's own formatting API. Turso doesn't export it, so without a
+          // shim pdo_sqlite falls through to system libsqlite3, where these
+          // functions interact badly with Turso's malloc/free and crash.
+          // This implementation is libc-based and ignores SQLite's %q / %Q
+          // format specifiers (used for SQL-quoting); pdo_sqlite uses the
+          // plain %s family for error message formatting, which is handled.
+          char *sqlite3_vsnprintf(int n, char *dst, const char *fmt, va_list ap) {
+              if (!dst || n <= 0) return dst;
+              vsnprintf(dst, (size_t)n, fmt, ap);
+              return dst;
+          }
+
+          char *sqlite3_snprintf(int n, char *dst, const char *fmt, ...) {
+              va_list ap;
+              va_start(ap, fmt);
+              sqlite3_vsnprintf(n, dst, fmt, ap);
+              va_end(ap);
+              return dst;
+          }
+
+          char *sqlite3_vmprintf(const char *fmt, va_list ap) {
+              va_list ap2;
+              va_copy(ap2, ap);
+              int len = vsnprintf(NULL, 0, fmt, ap2);
+              va_end(ap2);
+              if (len < 0) return NULL;
+              char *buf = (char *)malloc((size_t)len + 1);
+              if (!buf) return NULL;
+              vsnprintf(buf, (size_t)len + 1, fmt, ap);
+              return buf;
+          }
+
+          char *sqlite3_mprintf(const char *fmt, ...) {
+              va_list ap;
+              va_start(ap, fmt);
+              char *s = sqlite3_vmprintf(fmt, ap);
+              va_end(ap);
+              return s;
+          }
           C
 
           SHIM=/tmp/libturso-compat-shim.so
