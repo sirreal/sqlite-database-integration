@@ -44,17 +44,61 @@ jobs:
       - name: Clone Turso source
         run: git clone --depth 1 --branch '${{ steps.turso.outputs.tag }}' https://github.com/tursodatabase/turso.git
 
-      # Turso's stub!() macro expands to a `todo!()` that panics across the FFI
-      # boundary and aborts the PHP process. That blocks any call into a not-yet-
-      # implemented sqlite3_* function — e.g. sqlite3_set_authorizer, which
-      # PHP's pdo_sqlite calls during PDO construction. Rewrite the macro so
-      # stubbed functions return a zeroed value of their return type instead
-      # (0 / SQLITE_OK for ints, NULL for pointers). This lets the driver reach
-      # functions Turso does implement, so PHPUnit can produce a real report.
-      - name: Patch Turso stub macro to not abort
+      # Turso's C API shim aborts the PHP process via Rust panics in several
+      # places. These patches neutralise the ones pdo_sqlite trips over:
+      #
+      #   1. `stub!()` expands to `todo!()`; pdo_sqlite hits it during PDO
+      #      construction (sqlite3_set_authorizer). Rewrite to return a zeroed
+      #      value of the function's return type (0 / SQLITE_OK for ints, NULL
+      #      for pointers) instead.
+      #
+      #   2. The sqlite3_column_* functions `.expect()` that a row is present,
+      #      but pdo_sqlite legitimately calls them on statements that have not
+      #      yet stepped to SQLITE_ROW (e.g. for column metadata). Replace the
+      #      expect with an early return of the type's "null" value, matching
+      #      SQLite's actual behaviour.
+      - name: Patch Turso to not abort on recoverable conditions
         working-directory: turso
         run: |
           sed -i 's|todo!("{} is not implemented", stringify!($fn));|return unsafe { std::mem::zeroed() };|' sqlite3/src/lib.rs
+
+          python3 - <<'PY'
+          import re
+
+          path = 'sqlite3/src/lib.rs'
+          defaults = {
+              'sqlite3_column_type':   'SQLITE_NULL',
+              'sqlite3_column_int':    '0',
+              'sqlite3_column_int64':  '0',
+              'sqlite3_column_double': '0.0',
+              'sqlite3_column_blob':   'std::ptr::null()',
+              'sqlite3_column_bytes':  '0',
+              'sqlite3_column_text':   'std::ptr::null()',
+          }
+
+          pattern = re.compile(
+              r'(pub unsafe extern "C" fn (sqlite3_column_\w+)\([^)]*\)[^{]*\{)'
+              r'((?:[^{}]|\{[^{}]*\})*?)'
+              r'(let row = stmt\s*\.stmt\s*\.row\(\)\s*'
+              r'\.expect\("Function should only be called after `SQLITE_ROW`"\);)',
+              re.DOTALL,
+          )
+
+          def repl(m):
+              header, name, body, _ = m.group(1), m.group(2), m.group(3), m.group(4)
+              default = defaults.get(name, '0')
+              guarded = (
+                  f'let row = match stmt.stmt.row() {{ '
+                  f'Some(r) => r, None => return {default} }};'
+              )
+              return header + body + guarded
+
+          src = open(path).read()
+          src, n = pattern.subn(repl, src)
+          open(path, 'w').write(src)
+          print(f'patched {n} sqlite3_column_* functions')
+          PY
+
           echo '--- Patched stub! macro ---'
           sed -n '/macro_rules! stub/,/^}$/p' sqlite3/src/lib.rs
 
