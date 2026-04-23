@@ -596,18 +596,31 @@ jobs:
         working-directory: packages/mysql-on-sqlite
         # PHPUnit's own run completes in ~2 minutes, but PHP then hangs inside
         # zend_gc_collect_cycles → pdo_sqlite → Turso's sqlite3_finalize, which
-        # deadlocks on the sqlite3Inner mutex during process shutdown. Wrap
-        # the command in `timeout` so we bound process lifetime: once the test
-        # summary is printed, the process is killed and the step exits cleanly.
-        # The pass/fail signal comes from the summary, not the exit status.
+        # deadlocks on the sqlite3Inner mutex during process shutdown. We can't
+        # trust the process's exit status, so we derive pass/fail from a JUnit
+        # XML file written incrementally during the run: if the file records
+        # any <error> or <failure>, the step fails.
         run: |
           set +e
-          timeout --preserve-status --kill-after=10 180 \
-              php ./vendor/bin/phpunit -c ./phpunit.xml.dist
+          timeout --kill-after=10 180 \
+              php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
+                  --log-junit /tmp/phpunit-turso.xml
           ec=$?
-          # Exit 124 means timeout fired; anything else is PHPUnit's own status.
-          if [ "$ec" = "124" ] || [ "$ec" = "137" ]; then
-              echo "::notice::PHPUnit completed; process was killed during shutdown (Turso finalize deadlock)."
-              exit 0
+          if [ ! -s /tmp/phpunit-turso.xml ]; then
+              echo "::error::JUnit report not written — PHPUnit likely crashed before any tests ran."
+              exit "$ec"
           fi
-          exit "$ec"
+          python3 <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          cases = list(ET.parse('/tmp/phpunit-turso.xml').iter('testcase'))
+          errors = sum(1 for c in cases if c.find('error') is not None)
+          failures = sum(1 for c in cases if c.find('failure') is not None)
+          skipped = sum(1 for c in cases if c.find('skipped') is not None)
+          assertions = sum(int(c.get('assertions', 0) or 0) for c in cases)
+          total = len(cases)
+          passing = total - errors - failures - skipped
+          print(f"::notice::Turso DB: {passing}/{total} passing "
+                f"(errors={errors}, failures={failures}, skipped={skipped}, "
+                f"assertions={assertions})")
+          sys.exit(1 if errors or failures else 0)
+          PY
