@@ -317,9 +317,16 @@ jobs:
               -ex "bt" \
               --args "$(command -v php)"
 
-      - name: Run PHPUnit tests against Turso DB
+      - name: Run PHPUnit tests against Turso DB (under gdb)
         continue-on-error: true
         env:
-          LD_PRELOAD: ${{ steps.preload.outputs.value }}
+          PRELOAD: ${{ steps.preload.outputs.value }}
         working-directory: packages/mysql-on-sqlite
-        run: php ./vendor/bin/phpunit -c ./phpunit.xml.dist
+        run: |
+          gdb -batch \
+              -ex "set confirm off" \
+              -ex "set pagination off" \
+              -ex "set environment LD_PRELOAD=$PRELOAD" \
+              -ex "run ./vendor/bin/phpunit -c ./phpunit.xml.dist" \
+              -ex "bt 30" \
+              --args "$(command -v php)" || true
