@@ -293,29 +293,31 @@ jobs:
         working-directory: packages/mysql-on-sqlite
         run: |
           # Reproduce the first failing test's setUp path with a query logger
-          # wired up. When Turso rejects SQL, the last logged query is what
-          # Turso saw — printed right before the exception.
+          # wired up. The driver replaces any logger during construction, so
+          # we install ours on the driver's own connection afterwards.
           php <<'PHP'
           <?php
           require __DIR__ . '/tests/bootstrap.php';
 
           $pdo = new PDO('sqlite::memory:');
           $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-
           $conn = new WP_SQLite_Connection([ 'pdo' => $pdo ]);
+
+          $engine = new WP_SQLite_Driver($conn, 'wp');
+          fwrite(STDERR, "Driver construction ok\n");
+
           $logged = [];
-          $conn->set_query_logger(function (string $sql, array $params) use (&$logged) {
-              $logged[] = [$sql, $params];
-              fwrite(STDERR, sprintf("[sql #%d] %s\n", count($logged), $sql));
-              if ($params) {
-                  fwrite(STDERR, '           params: ' . json_encode($params) . "\n");
+          $engine->get_connection()->set_query_logger(
+              function (string $sql, array $params) use (&$logged) {
+                  $logged[] = [$sql, $params];
+                  fwrite(STDERR, sprintf("[sql #%d] %s\n", count($logged), $sql));
+                  if ($params) {
+                      fwrite(STDERR, '           params: ' . json_encode($params) . "\n");
+                  }
               }
-          });
+          );
 
           try {
-              $engine = new WP_SQLite_Driver($conn, 'wp');
-              fwrite(STDERR, "Driver construction ok\n");
-
               $engine->query("CREATE TABLE _options (
                   ID INTEGER PRIMARY KEY AUTO_INCREMENT NOT NULL,
                   option_name TEXT NOT NULL default '',
@@ -324,10 +326,12 @@ jobs:
               fwrite(STDERR, "CREATE TABLE _options ok\n");
           } catch (\Throwable $e) {
               fwrite(STDERR, "EXC: " . $e->getMessage() . "\n");
-              fwrite(STDERR, "last SQL: " . ($logged[count($logged) - 1][0] ?? '<none>') . "\n");
-              if (($last = $logged[count($logged) - 1][0] ?? null) !== null) {
-                  fwrite(STDERR, "char at offset 189: " . substr($last, 180, 20) . "\n");
-              }
+              $last = end($logged) ?: ['<no SQL logged>', []];
+              fwrite(STDERR, "last SQL:\n" . $last[0] . "\n");
+              fwrite(STDERR, sprintf(
+                  "char at offset 189 window [180..209]:\n  %s\n",
+                  substr($last[0], 180, 30)
+              ));
           }
           PHP
 
