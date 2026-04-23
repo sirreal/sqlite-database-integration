@@ -62,6 +62,48 @@ jobs:
         run: |
           sed -i 's|todo!("{} is not implemented", stringify!($fn));|return unsafe { std::mem::zeroed() };|' sqlite3/src/lib.rs
 
+          # Turso's sqlite3_finalize deadlocks when PHP's garbage collector
+          # runs it during shutdown: sqlite3Inner's mutex is held by a Turso
+          # async thread that stays alive past the stmt's lifetime.
+          # 1) Skip stmt_run_to_completion — pdo_sqlite is discarding the
+          #    statement, so finishing execution gains us nothing.
+          # 2) Replace .lock().unwrap() on the db inner with try_lock: if
+          #    another holder exists, skip the stmt_list cleanup (small leak)
+          #    rather than block forever.
+          python3 - <<'PY_FIN'
+          path = 'sqlite3/src/lib.rs'
+          src = open(path).read()
+
+          old = (
+              "    // first, finalize any execution if it was unfinished\n"
+              "    // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)\n"
+              "    // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)\n"
+              "    let result = stmt_run_to_completion(stmt);\n"
+              "    if result != SQLITE_OK {\n"
+              "        return result;\n"
+              "    }\n"
+          )
+          new = (
+              "    // (stmt_run_to_completion elided to avoid a deadlock in\n"
+              "    // PHP's garbage-collected sqlite3_finalize path.)\n"
+          )
+          assert old in src, 'stmt_run_to_completion call not found'
+          src = src.replace(old, new, 1)
+
+          old = "        let mut db_inner = db.inner.lock().unwrap();\n"
+          new = (
+              "        let mut db_inner = match db.inner.try_lock() {\n"
+              "            Ok(g) => g,\n"
+              "            Err(_) => { let _ = Box::from_raw(stmt); return SQLITE_OK; }\n"
+              "        };\n"
+          )
+          assert old in src, 'finalize lock not found'
+          src = src.replace(old, new, 1)
+
+          open(path, 'w').write(src)
+          print('patched sqlite3_finalize (skip run_to_completion, try_lock)')
+          PY_FIN
+
           python3 - <<'PY'
           import re
 
@@ -428,25 +470,37 @@ jobs:
         working-directory: packages/mysql-on-sqlite
         run: |
           python3 - <<'PY'
-          # Driver patches ATTEMPTED and abandoned:
-          #
-          # - temporary_table_exists → false: would save ~250 errors from
-          #   'no such table: sqlite_temp_master', but changing the predicate's
-          #   return value makes the driver take code paths that deadlock inside
-          #   Turso's sqlite3_finalize during subsequent tests (gdb traces show
-          #   a mutex on sqlite3Inner held across the step->finalize cycle).
-          #   Requires a Turso fix.
-          #
-          # - sync_column_key_info row-value UPDATE rewrite: valid SQL, but
-          #   triggers a pathological case in Turso's query planner that hangs
-          #   PHPUnit somewhere after test 504/667.
-          #
-          # Only the wp_die polyfill is safe; it doesn't change driver/query
-          # behaviour.
+          # 1. Turso doesn't expose `sqlite_temp_master`. The driver queries it
+          #    to decide whether to use temp-schema tables, but Turso doesn't
+          #    support TEMP tables at all, so the predicate is always false.
+          path = 'src/sqlite/class-wp-sqlite-information-schema-builder.php'
+          src = open(path).read()
+          old = (
+              "\tpublic function temporary_table_exists( string $table_name ): bool {\n"
+              "\t\t/*\n"
+              "\t\t * We could search in the \"{$this->temporary_table_prefix}tables\" table,\n"
+              "\t\t * but it may not exist yet, so using \"sqlite_temp_master\" is simpler.\n"
+              "\t\t */\n"
+              "\t\t$stmt = $this->connection->query(\n"
+              "\t\t\t\"SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?\",\n"
+              "\t\t\tarray( $table_name )\n"
+              "\t\t);\n"
+              "\t\treturn $stmt->fetchColumn() === '1';\n"
+              "\t}"
+          )
+          new = (
+              "\tpublic function temporary_table_exists( string $table_name ): bool {\n"
+              "\t\treturn false;  // Turso has no TEMP tables and no sqlite_temp_master.\n"
+              "\t}"
+          )
+          assert old in src, 'temporary_table_exists body not found'
+          src = src.replace(old, new, 1)
+          open(path, 'w').write(src)
+          print('patched information-schema-builder.php')
 
-          # wp_die polyfill: real WordPress provides wp_die(); the unit-test
-          # bootstrap doesn't, so 21 tests hit an 'undefined function' error
-          # when a driver error path tries to call it.
+          # 2. wp_die polyfill: real WordPress provides wp_die(); the unit-test
+          #    bootstrap doesn't, so 21 tests hit an 'undefined function' error
+          #    when a driver error path tries to call it.
           path = 'tests/bootstrap.php'
           src = open(path).read()
           marker = "if ( ! function_exists( 'do_action' ) ) {"
