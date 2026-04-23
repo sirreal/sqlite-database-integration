@@ -467,23 +467,9 @@ jobs:
           open(path, 'w').write(src)
           print('patched information-schema-builder.php (temporary_table_exists only)')
 
-          # 3. wp_die polyfill: 21 tests hit an error path in the driver that
-          #    calls wp_die(). Real WordPress provides it; the unit-test bootstrap
-          #    does not. Add a minimal polyfill.
-          path = 'tests/bootstrap.php'
-          src = open(path).read()
-          marker = "if ( ! function_exists( 'do_action' ) ) {"
-          inject = (
-              "if ( ! function_exists( 'wp_die' ) ) {\n"
-              "\tfunction wp_die( $message = '', $title = '', $args = array() ) {\n"
-              "\t\tthrow new \\RuntimeException( is_string( $message ) ? $message : 'wp_die' );\n"
-              "\t}\n"
-              "}\n\n"
-          )
-          assert marker in src
-          src = src.replace(marker, inject + marker, 1)
-          open(path, 'w').write(src)
-          print('added wp_die polyfill to bootstrap.php')
+          # (wp_die polyfill disabled while bisecting which patch causes the
+          # hang at test 504/667. Without any driver patch the suite runs to
+          # completion; WITH temporary_table_exists + wp_die it hangs.)
           PY
 
       - name: Capture failing SQL from the first failing driver test
