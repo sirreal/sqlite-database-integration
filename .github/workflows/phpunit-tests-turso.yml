@@ -588,6 +588,7 @@ jobs:
           set +e
           timeout --kill-after=10 600 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
+                  --debug \
                   --log-junit /tmp/phpunit-turso.xml
           ec=$?
           if [ ! -s /tmp/phpunit-turso.xml ]; then
