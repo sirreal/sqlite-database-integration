@@ -283,6 +283,38 @@ jobs:
           ignore-cache: "yes"
           composer-options: "--optimize-autoloader"
 
+      - name: Patch driver to surface failing SQL in exceptions
+        working-directory: packages/mysql-on-sqlite
+        run: |
+          # Wrap WP_SQLite_Connection::query() in a try/catch that rethrows with
+          # the SQL appended to the message, so we see what Turso rejects.
+          python3 - <<'PY'
+          import re
+          path = 'src/sqlite/class-wp-sqlite-connection.php'
+          src = open(path).read()
+          before = (
+              "\t\t$stmt = $this->pdo->prepare( $sql );\n"
+              "\t\t$stmt->execute( $params );\n"
+              "\t\treturn $stmt;"
+          )
+          after = (
+              "\t\ttry {\n"
+              "\t\t\t$stmt = $this->pdo->prepare( $sql );\n"
+              "\t\t\t$stmt->execute( $params );\n"
+              "\t\t\treturn $stmt;\n"
+              "\t\t} catch ( \\PDOException $e ) {\n"
+              "\t\t\tthrow new \\PDOException(\n"
+              "\t\t\t\t$e->getMessage() . \" [SQL: \" . $sql . \"]\",\n"
+              "\t\t\t\t(int) $e->getCode(),\n"
+              "\t\t\t\t$e\n"
+              "\t\t\t);\n"
+              "\t\t}"
+          )
+          assert before in src, 'query() body not found'
+          open(path, 'w').write(src.replace(before, after, 1))
+          print('patched WP_SQLite_Connection::query()')
+          PY
+
       - name: Install gdb
         run: sudo apt-get install -y --no-install-recommends gdb
 
