@@ -62,46 +62,60 @@ jobs:
         run: |
           sed -i 's|todo!("{} is not implemented", stringify!($fn));|return unsafe { std::mem::zeroed() };|' sqlite3/src/lib.rs
 
-          # Turso's sqlite3_finalize deadlocks when PHP's garbage collector
-          # runs it during shutdown: sqlite3Inner's mutex is held by a Turso
-          # async thread that stays alive past the stmt's lifetime.
-          # 1) Skip stmt_run_to_completion — pdo_sqlite is discarding the
-          #    statement, so finishing execution gains us nothing.
-          # 2) Replace .lock().unwrap() on the db inner with try_lock: if
-          #    another holder exists, skip the stmt_list cleanup (small leak)
-          #    rather than block forever.
+          # Turso's sqlite3_finalize blocks indefinitely on sqlite3Inner's
+          # mutex during PHP shutdown. Replace .lock().unwrap() with try_lock:
+          # on contention, skip the stmt_list cleanup (small leak) rather
+          # than block forever. The rest of finalize (destructors, free) still
+          # runs.
           python3 - <<'PY_FIN'
           path = 'sqlite3/src/lib.rs'
           src = open(path).read()
-
           old = (
-              "    // first, finalize any execution if it was unfinished\n"
-              "    // (for example, many drivers can consume just one row and finalize statement after that, while there still can be work to do)\n"
-              "    // (this is necessary because queries like INSERT INTO t VALUES (1), (2), (3) RETURNING id return values within a transaction)\n"
-              "    let result = stmt_run_to_completion(stmt);\n"
-              "    if result != SQLITE_OK {\n"
-              "        return result;\n"
+              "    if !stmt_ref.db.is_null() {\n"
+              "        let db = &mut *stmt_ref.db;\n"
+              "        let mut db_inner = db.inner.lock().unwrap();\n"
+              "\n"
+              "        if db_inner.stmt_list == stmt {\n"
+              "            db_inner.stmt_list = stmt_ref.next;\n"
+              "        } else {\n"
+              "            let mut current = db_inner.stmt_list;\n"
+              "            while !current.is_null() {\n"
+              "                let current_ref = &mut *current;\n"
+              "                if current_ref.next == stmt {\n"
+              "                    current_ref.next = stmt_ref.next;\n"
+              "                    break;\n"
+              "                }\n"
+              "                current = current_ref.next;\n"
+              "            }\n"
+              "        }\n"
               "    }\n"
           )
           new = (
-              "    // (stmt_run_to_completion elided to avoid a deadlock in\n"
-              "    // PHP's garbage-collected sqlite3_finalize path.)\n"
+              "    if !stmt_ref.db.is_null() {\n"
+              "        let db = &mut *stmt_ref.db;\n"
+              "        // try_lock: on contention, skip stmt_list cleanup to\n"
+              "        // avoid deadlocking in PHP's GC-driven shutdown path.\n"
+              "        if let Ok(mut db_inner) = db.inner.try_lock() {\n"
+              "            if db_inner.stmt_list == stmt {\n"
+              "                db_inner.stmt_list = stmt_ref.next;\n"
+              "            } else {\n"
+              "                let mut current = db_inner.stmt_list;\n"
+              "                while !current.is_null() {\n"
+              "                    let current_ref = &mut *current;\n"
+              "                    if current_ref.next == stmt {\n"
+              "                        current_ref.next = stmt_ref.next;\n"
+              "                        break;\n"
+              "                    }\n"
+              "                    current = current_ref.next;\n"
+              "                }\n"
+              "            }\n"
+              "        }\n"
+              "    }\n"
           )
-          assert old in src, 'stmt_run_to_completion call not found'
+          assert old in src, 'finalize block not found'
           src = src.replace(old, new, 1)
-
-          old = "        let mut db_inner = db.inner.lock().unwrap();\n"
-          new = (
-              "        let mut db_inner = match db.inner.try_lock() {\n"
-              "            Ok(g) => g,\n"
-              "            Err(_) => { let _ = Box::from_raw(stmt); return SQLITE_OK; }\n"
-              "        };\n"
-          )
-          assert old in src, 'finalize lock not found'
-          src = src.replace(old, new, 1)
-
           open(path, 'w').write(src)
-          print('patched sqlite3_finalize (skip run_to_completion, try_lock)')
+          print('patched sqlite3_finalize (try_lock)')
           PY_FIN
 
           python3 - <<'PY'
