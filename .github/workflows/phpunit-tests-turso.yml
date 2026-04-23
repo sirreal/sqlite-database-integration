@@ -363,7 +363,6 @@ jobs:
               --args "$(command -v php)"
 
       - name: Run PHPUnit tests against Turso DB (under gdb)
-        continue-on-error: true
         env:
           PRELOAD: ${{ steps.preload.outputs.value }}
         working-directory: packages/mysql-on-sqlite
@@ -374,4 +373,4 @@ jobs:
               -ex "set environment LD_PRELOAD=$PRELOAD" \
               -ex "run ./vendor/bin/phpunit -c ./phpunit.xml.dist" \
               -ex "bt 30" \
-              --args "$(command -v php)" || true
+              --args "$(command -v php)"
