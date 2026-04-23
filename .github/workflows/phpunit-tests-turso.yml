@@ -78,12 +78,37 @@ jobs:
           php-version: '8.5'
           tools: phpunit-polyfills
 
-      - name: Report SQLite version via Turso preload
+      - name: Smoke-test pdo_sqlite against Turso
         continue-on-error: true
         env:
           LD_PRELOAD: ${{ steps.turso-lib.outputs.path }}
         run: |
-          php -r "echo 'Turso sqlite_version(): ' . (new PDO('sqlite::memory:'))->query('SELECT sqlite_version()')->fetch()[0] . PHP_EOL;"
+          php <<'PHP'
+          <?php
+          echo "version: ", (new PDO('sqlite::memory:'))->query('SELECT sqlite_version()')->fetch()[0], "\n";
+
+          $pdo = new PDO('sqlite::memory:');
+          $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+          $pdo->exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)');
+          echo "create table: ok\n";
+
+          $pdo->exec("INSERT INTO t (v) VALUES ('hello')");
+          echo "insert exec: ok\n";
+
+          $stmt = $pdo->prepare('INSERT INTO t (v) VALUES (?)');
+          $stmt->execute(['world']);
+          echo "insert prepared: ok\n";
+
+          $rows = $pdo->query('SELECT id, v FROM t ORDER BY id')->fetchAll(PDO::FETCH_ASSOC);
+          echo "select: ", json_encode($rows), "\n";
+
+          $stmt = $pdo->prepare('SELECT v FROM t WHERE id = ?');
+          $stmt->execute([1]);
+          echo "select prepared: ", $stmt->fetchColumn(), "\n";
+
+          unset($stmt, $pdo);
+          echo "close: ok\n";
+          PHP
 
       - name: Install Composer dependencies (root)
         uses: ramsey/composer-install@v3
