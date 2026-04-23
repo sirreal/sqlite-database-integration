@@ -310,10 +310,6 @@ jobs:
           $engine->get_connection()->set_query_logger(
               function (string $sql, array $params) use (&$logged) {
                   $logged[] = [$sql, $params];
-                  fwrite(STDERR, sprintf("[sql #%d] %s\n", count($logged), $sql));
-                  if ($params) {
-                      fwrite(STDERR, '           params: ' . json_encode($params) . "\n");
-                  }
               }
           );
 
@@ -326,12 +322,18 @@ jobs:
               fwrite(STDERR, "CREATE TABLE _options ok\n");
           } catch (\Throwable $e) {
               fwrite(STDERR, "EXC: " . $e->getMessage() . "\n");
-              $last = end($logged) ?: ['<no SQL logged>', []];
-              fwrite(STDERR, "last SQL:\n" . $last[0] . "\n");
-              fwrite(STDERR, sprintf(
-                  "char at offset 189 window [180..209]:\n  %s\n",
-                  substr($last[0], 180, 30)
-              ));
+              fwrite(STDERR, "--- last 3 SQL statements sent to SQLite ---\n");
+              foreach (array_slice($logged, -3) as $i => $entry) {
+                  [$sql, $params] = $entry;
+                  fwrite(STDERR, "---\nSQL (length " . strlen($sql) . "):\n" . $sql . "\n");
+                  if ($params) {
+                      fwrite(STDERR, "params: " . json_encode($params) . "\n");
+                  }
+                  fwrite(STDERR, sprintf(
+                      "window [offset 180..209]:\n  %s\n",
+                      substr($sql, 180, 30)
+                  ));
+              }
           }
           PHP
 
