@@ -62,61 +62,10 @@ jobs:
         run: |
           sed -i 's|todo!("{} is not implemented", stringify!($fn));|return unsafe { std::mem::zeroed() };|' sqlite3/src/lib.rs
 
-          # Turso's sqlite3_finalize blocks indefinitely on sqlite3Inner's
-          # mutex during PHP shutdown. Replace .lock().unwrap() with try_lock:
-          # on contention, skip the stmt_list cleanup (small leak) rather
-          # than block forever. The rest of finalize (destructors, free) still
-          # runs.
-          python3 - <<'PY_FIN'
-          path = 'sqlite3/src/lib.rs'
-          src = open(path).read()
-          old = (
-              "    if !stmt_ref.db.is_null() {\n"
-              "        let db = &mut *stmt_ref.db;\n"
-              "        let mut db_inner = db.inner.lock().unwrap();\n"
-              "\n"
-              "        if db_inner.stmt_list == stmt {\n"
-              "            db_inner.stmt_list = stmt_ref.next;\n"
-              "        } else {\n"
-              "            let mut current = db_inner.stmt_list;\n"
-              "            while !current.is_null() {\n"
-              "                let current_ref = &mut *current;\n"
-              "                if current_ref.next == stmt {\n"
-              "                    current_ref.next = stmt_ref.next;\n"
-              "                    break;\n"
-              "                }\n"
-              "                current = current_ref.next;\n"
-              "            }\n"
-              "        }\n"
-              "    }\n"
-          )
-          new = (
-              "    if !stmt_ref.db.is_null() {\n"
-              "        let db = &mut *stmt_ref.db;\n"
-              "        // try_lock: on contention, skip stmt_list cleanup to\n"
-              "        // avoid deadlocking in PHP's GC-driven shutdown path.\n"
-              "        if let Ok(mut db_inner) = db.inner.try_lock() {\n"
-              "            if db_inner.stmt_list == stmt {\n"
-              "                db_inner.stmt_list = stmt_ref.next;\n"
-              "            } else {\n"
-              "                let mut current = db_inner.stmt_list;\n"
-              "                while !current.is_null() {\n"
-              "                    let current_ref = &mut *current;\n"
-              "                    if current_ref.next == stmt {\n"
-              "                        current_ref.next = stmt_ref.next;\n"
-              "                        break;\n"
-              "                    }\n"
-              "                    current = current_ref.next;\n"
-              "                }\n"
-              "            }\n"
-              "        }\n"
-              "    }\n"
-          )
-          assert old in src, 'finalize block not found'
-          src = src.replace(old, new, 1)
-          open(path, 'w').write(src)
-          print('patched sqlite3_finalize (try_lock)')
-          PY_FIN
+          # (Attempted sqlite3_finalize try_lock patch caused SIGSEGV mid-run:
+          # leaking the stmt on contention left db.stmt_list with a dangling
+          # pointer for the next finalize to walk. Reverted. The deadlock is
+          # handled at the CI level via `timeout` wrapping PHPUnit.)
 
           python3 - <<'PY'
           import re
@@ -484,37 +433,17 @@ jobs:
         working-directory: packages/mysql-on-sqlite
         run: |
           python3 - <<'PY'
-          # 1. Turso doesn't expose `sqlite_temp_master`. The driver queries it
-          #    to decide whether to use temp-schema tables, but Turso doesn't
-          #    support TEMP tables at all, so the predicate is always false.
-          path = 'src/sqlite/class-wp-sqlite-information-schema-builder.php'
-          src = open(path).read()
-          old = (
-              "\tpublic function temporary_table_exists( string $table_name ): bool {\n"
-              "\t\t/*\n"
-              "\t\t * We could search in the \"{$this->temporary_table_prefix}tables\" table,\n"
-              "\t\t * but it may not exist yet, so using \"sqlite_temp_master\" is simpler.\n"
-              "\t\t */\n"
-              "\t\t$stmt = $this->connection->query(\n"
-              "\t\t\t\"SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?\",\n"
-              "\t\t\tarray( $table_name )\n"
-              "\t\t);\n"
-              "\t\treturn $stmt->fetchColumn() === '1';\n"
-              "\t}"
-          )
-          new = (
-              "\tpublic function temporary_table_exists( string $table_name ): bool {\n"
-              "\t\treturn false;  // Turso has no TEMP tables and no sqlite_temp_master.\n"
-              "\t}"
-          )
-          assert old in src, 'temporary_table_exists body not found'
-          src = src.replace(old, new, 1)
-          open(path, 'w').write(src)
-          print('patched information-schema-builder.php')
+          # Abandoned driver patches:
+          # - temporary_table_exists → false triggers a Turso mid-run mutex
+          #   deadlock. Leaving the query in place; the resulting 250 errors
+          #   are preferable to an indefinite hang.
+          # - sync_column_key_info UPDATE rewrite triggers a Turso query-
+          #   planner pathological case; similar hang.
+          # Only the wp_die polyfill is safe (it doesn't alter query flow).
 
-          # 2. wp_die polyfill: real WordPress provides wp_die(); the unit-test
-          #    bootstrap doesn't, so 21 tests hit an 'undefined function' error
-          #    when a driver error path tries to call it.
+          # wp_die polyfill: real WordPress provides wp_die(); the unit-test
+          # bootstrap doesn't, so 21 tests hit an 'undefined function' error
+          # when a driver error path tries to call it.
           path = 'tests/bootstrap.php'
           src = open(path).read()
           marker = "if ( ! function_exists( 'do_action' ) ) {"
