@@ -587,10 +587,10 @@ jobs:
         run: |
           set +e
           # Tests known to hang against Turso main (pinned commit). The ALTER
-          # TABLE flow emits CREATE TABLE + INSERT SELECT + DROP + RENAME with
-          # a NOT NULL column on the new table; Turso hangs on one of those.
-          # Skip via a negative-lookahead --filter.
-          skip_regex='^(?!WP_SQLite_Driver_Translation_Tests::testAlterTableAddColumnWithNotNull$).+'
+          # TABLE flow emits CREATE TABLE + INSERT SELECT + DROP + RENAME,
+          # and Turso hangs somewhere in that sequence. Skip all tests that
+          # go through it so the rest of the suite can run to completion.
+          skip_regex='^(?!WP_SQLite_Driver_Translation_Tests::testAlterTable).+'
           timeout --kill-after=10 180 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --debug \
