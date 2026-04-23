@@ -65,6 +65,7 @@ jobs:
           tools: phpunit-polyfills
 
       - name: Report SQLite version via Turso preload
+        continue-on-error: true
         env:
           LD_PRELOAD: ${{ steps.turso-lib.outputs.path }}
         run: |
