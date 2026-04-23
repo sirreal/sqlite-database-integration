@@ -283,40 +283,53 @@ jobs:
           ignore-cache: "yes"
           composer-options: "--optimize-autoloader"
 
-      - name: Patch driver to surface failing SQL in exceptions
-        working-directory: packages/mysql-on-sqlite
-        run: |
-          # Wrap WP_SQLite_Connection::query() in a try/catch that rethrows with
-          # the SQL appended to the message, so we see what Turso rejects.
-          python3 - <<'PY'
-          import re
-          path = 'src/sqlite/class-wp-sqlite-connection.php'
-          src = open(path).read()
-          before = (
-              "\t\t$stmt = $this->pdo->prepare( $sql );\n"
-              "\t\t$stmt->execute( $params );\n"
-              "\t\treturn $stmt;"
-          )
-          after = (
-              "\t\ttry {\n"
-              "\t\t\t$stmt = $this->pdo->prepare( $sql );\n"
-              "\t\t\t$stmt->execute( $params );\n"
-              "\t\t\treturn $stmt;\n"
-              "\t\t} catch ( \\PDOException $e ) {\n"
-              "\t\t\tthrow new \\PDOException(\n"
-              "\t\t\t\t$e->getMessage() . \" [SQL: \" . $sql . \"]\",\n"
-              "\t\t\t\t(int) $e->getCode(),\n"
-              "\t\t\t\t$e\n"
-              "\t\t\t);\n"
-              "\t\t}"
-          )
-          assert before in src, 'query() body not found'
-          open(path, 'w').write(src.replace(before, after, 1))
-          print('patched WP_SQLite_Connection::query()')
-          PY
-
       - name: Install gdb
         run: sudo apt-get install -y --no-install-recommends gdb
+
+      - name: Capture failing SQL from the first failing driver test
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.preload.outputs.value }}
+        working-directory: packages/mysql-on-sqlite
+        run: |
+          # Reproduce the first failing test's setUp path with a query logger
+          # wired up. When Turso rejects SQL, the last logged query is what
+          # Turso saw — printed right before the exception.
+          php <<'PHP'
+          <?php
+          require __DIR__ . '/tests/bootstrap.php';
+
+          $pdo = new PDO('sqlite::memory:');
+          $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+          $conn = new WP_SQLite_Connection([ 'pdo' => $pdo ]);
+          $logged = [];
+          $conn->set_query_logger(function (string $sql, array $params) use (&$logged) {
+              $logged[] = [$sql, $params];
+              fwrite(STDERR, sprintf("[sql #%d] %s\n", count($logged), $sql));
+              if ($params) {
+                  fwrite(STDERR, '           params: ' . json_encode($params) . "\n");
+              }
+          });
+
+          try {
+              $engine = new WP_SQLite_Driver($conn, 'wp');
+              fwrite(STDERR, "Driver construction ok\n");
+
+              $engine->query("CREATE TABLE _options (
+                  ID INTEGER PRIMARY KEY AUTO_INCREMENT NOT NULL,
+                  option_name TEXT NOT NULL default '',
+                  option_value TEXT NOT NULL default ''
+              );");
+              fwrite(STDERR, "CREATE TABLE _options ok\n");
+          } catch (\Throwable $e) {
+              fwrite(STDERR, "EXC: " . $e->getMessage() . "\n");
+              fwrite(STDERR, "last SQL: " . ($logged[count($logged) - 1][0] ?? '<none>') . "\n");
+              if (($last = $logged[count($logged) - 1][0] ?? null) !== null) {
+                  fwrite(STDERR, "char at offset 189: " . substr($last, 180, 20) . "\n");
+              }
+          }
+          PHP
 
       - name: Diagnose createFunction behavior
         continue-on-error: true
