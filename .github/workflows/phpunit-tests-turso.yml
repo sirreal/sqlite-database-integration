@@ -428,48 +428,31 @@ jobs:
         working-directory: packages/mysql-on-sqlite
         run: |
           python3 - <<'PY'
-          import re
+          # Bisect result: temporary_table_exists → false changes test flow in a
+          # way that trips a Turso sqlite3_finalize deadlock during PHP GC,
+          # hanging the suite at test 504/667. Keep only the wp_die polyfill,
+          # which doesn't change driver/query behaviour.
+          #
+          # The sync_column_key_info row-value UPDATE rewrite ran into a
+          # separate Turso pathological case; also left alone.
 
-          # 1. Turso doesn't expose `sqlite_temp_master`. The driver queries it
-          #    to decide whether to use temp-schema tables, but Turso doesn't
-          #    support TEMP tables at all, so the predicate is always false.
-          path = 'src/sqlite/class-wp-sqlite-information-schema-builder.php'
+          # wp_die polyfill: 21 tests hit an error path in the driver that
+          # calls wp_die(). Real WordPress provides it; the unit-test bootstrap
+          # does not. Add a minimal polyfill.
+          path = 'tests/bootstrap.php'
           src = open(path).read()
-          old = (
-              "\tpublic function temporary_table_exists( string $table_name ): bool {\n"
-              "\t\t/*\n"
-              "\t\t * We could search in the \"{$this->temporary_table_prefix}tables\" table,\n"
-              "\t\t * but it may not exist yet, so using \"sqlite_temp_master\" is simpler.\n"
-              "\t\t */\n"
-              "\t\t$stmt = $this->connection->query(\n"
-              "\t\t\t\"SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?\",\n"
-              "\t\t\tarray( $table_name )\n"
-              "\t\t);\n"
-              "\t\treturn $stmt->fetchColumn() === '1';\n"
-              "\t}"
+          marker = "if ( ! function_exists( 'do_action' ) ) {"
+          inject = (
+              "if ( ! function_exists( 'wp_die' ) ) {\n"
+              "\tfunction wp_die( $message = '', $title = '', $args = array() ) {\n"
+              "\t\tthrow new \\RuntimeException( is_string( $message ) ? $message : 'wp_die' );\n"
+              "\t}\n"
+              "}\n\n"
           )
-          new = (
-              "\tpublic function temporary_table_exists( string $table_name ): bool {\n"
-              "\t\t// Turso compatibility: it does not support TEMP tables or\n"
-              "\t\t// expose sqlite_temp_master, so this is always false.\n"
-              "\t\treturn false;\n"
-              "\t}"
-          )
-          assert old in src, 'temporary_table_exists body not found'
-          src = src.replace(old, new, 1)
-
-          # (Earlier attempt also rewrote sync_column_key_info's UPDATE to
-          # work around Turso's lack of row-value assignment from a subquery,
-          # but the rewrite caused PHPUnit to hang indefinitely on a specific
-          # test around position 504/667 — likely a pathological case in
-          # Turso's query planner. Dropped for now; the 40 affected tests
-          # remain errors.)
+          assert marker in src
+          src = src.replace(marker, inject + marker, 1)
           open(path, 'w').write(src)
-          print('patched information-schema-builder.php (temporary_table_exists only)')
-
-          # (wp_die polyfill disabled while bisecting which patch causes the
-          # hang at test 504/667. Without any driver patch the suite runs to
-          # completion; WITH temporary_table_exists + wp_die it hangs.)
+          print('added wp_die polyfill to bootstrap.php')
           PY
 
       - name: Capture failing SQL from the first failing driver test
