@@ -123,6 +123,64 @@ jobs:
           ignore-cache: "yes"
           composer-options: "--optimize-autoloader"
 
+      - name: Staged reproduction of test setUp()
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.turso-lib.outputs.path }}
+        working-directory: packages/mysql-on-sqlite
+        run: |
+          php -d 'output_buffering=0' <<'PHP'
+          <?php
+          require __DIR__ . '/tests/bootstrap.php';
+          echo "[1] bootstrap ok\n";
+
+          $pdo_class = PHP_VERSION_ID >= 80400 ? PDO\SQLite::class : PDO::class;
+          $pdo = new $pdo_class('sqlite::memory:');
+          echo "[2] PDO({$pdo_class}) ok\n";
+
+          $pdo->exec('PRAGMA foreign_keys = ON');
+          echo "[3] PRAGMA foreign_keys ok\n";
+
+          // Same as WP_SQLite_PDO_User_Defined_Functions::register_for but with
+          // a running count so we see how far we got before any crash.
+          $funcs = new WP_SQLite_PDO_User_Defined_Functions();
+          $ref = new ReflectionClass($funcs);
+          $prop = $ref->getProperty('functions');
+          $prop->setAccessible(true);
+          $list = $prop->getValue($funcs);
+          echo "[4] UDF list: " . count($list) . " entries\n";
+
+          $n = 0;
+          foreach ($list as $name => $method) {
+              $n++;
+              if ($pdo instanceof PDO\SQLite) {
+                  $pdo->createFunction($name, [$funcs, $method]);
+              } else {
+                  $pdo->sqliteCreateFunction($name, [$funcs, $method]);
+              }
+              echo "[5.{$n}] registered {$name}\n";
+          }
+          echo "[6] all UDFs registered\n";
+
+          // Register a tiny extra query to see if calling a registered UDF from SQL works.
+          $row = $pdo->query("SELECT md5('x') AS v")->fetch(PDO::FETCH_ASSOC);
+          echo "[7] md5('x') -> " . json_encode($row) . "\n";
+
+          // Now build the full driver.
+          $conn = new WP_SQLite_Connection(['pdo' => $pdo]);
+          echo "[8] Connection ok\n";
+
+          $engine = new WP_SQLite_Driver($conn, 'wp');
+          echo "[9] Driver ok\n";
+
+          $engine->query("CREATE TABLE _options (
+              ID INTEGER PRIMARY KEY AUTO_INCREMENT NOT NULL,
+              option_name TEXT NOT NULL default '',
+              option_value TEXT NOT NULL default ''
+          );");
+          echo "[10] CREATE TABLE _options ok\n";
+          PHP
+
       - name: Run PHPUnit tests against Turso DB
         continue-on-error: true
         env:
