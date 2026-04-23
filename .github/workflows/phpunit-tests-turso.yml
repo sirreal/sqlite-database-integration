@@ -23,14 +23,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Determine latest Turso release
+      # Pinned to a specific main commit rather than a release tag. The latest
+      # stable release (v0.5.3) lacks TEMP-table / sqlite_temp_master support
+      # (added in PR #6323), which this driver relies on heavily. Bump this
+      # SHA to pull in newer Turso fixes.
+      - name: Set Turso commit to build
         id: turso
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          TAG=$(gh release view --repo tursodatabase/turso --json tagName --jq .tagName)
-          echo "Using Turso release: $TAG"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        run: echo "sha=375f5d55e26aa90c54abaadce7e035d8d0c6893d" >> "$GITHUB_OUTPUT"
 
       - name: Cache Turso build
         uses: actions/cache@v4
@@ -39,10 +38,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             turso/target
-          key: turso-${{ runner.os }}-${{ steps.turso.outputs.tag }}-${{ hashFiles('.github/workflows/phpunit-tests-turso.yml') }}
+          key: turso-${{ runner.os }}-${{ steps.turso.outputs.sha }}-${{ hashFiles('.github/workflows/phpunit-tests-turso.yml') }}
 
       - name: Clone Turso source
-        run: git clone --depth 1 --branch '${{ steps.turso.outputs.tag }}' https://github.com/tursodatabase/turso.git
+        run: |
+          git clone --filter=blob:none https://github.com/tursodatabase/turso.git
+          git -C turso checkout '${{ steps.turso.outputs.sha }}'
 
       # Turso's C API shim aborts the PHP process via Rust panics in several
       # places. These patches neutralise the ones pdo_sqlite trips over:
@@ -179,12 +180,6 @@ jobs:
           {
               return sqlite3_create_collation_v2(db, name, enc, ctx, cmp, 0);
           }
-
-          extern long long sqlite3_value_int64(sqlite3_value *v);
-          int sqlite3_value_int(sqlite3_value *v) { return (int)sqlite3_value_int64(v); }
-
-          extern void sqlite3_result_int64(sqlite3_context *ctx, long long v);
-          void sqlite3_result_int(sqlite3_context *ctx, int v) { sqlite3_result_int64(ctx, (long long)v); }
 
           // SQLite's own formatting API. Turso doesn't export it. A naive
           // libc-only wrapper breaks because SQLite defines extra conversion
@@ -433,17 +428,9 @@ jobs:
         working-directory: packages/mysql-on-sqlite
         run: |
           python3 - <<'PY'
-          # Abandoned driver patches:
-          # - temporary_table_exists → false triggers a Turso mid-run mutex
-          #   deadlock. Leaving the query in place; the resulting 250 errors
-          #   are preferable to an indefinite hang.
-          # - sync_column_key_info UPDATE rewrite triggers a Turso query-
-          #   planner pathological case; similar hang.
-          # Only the wp_die polyfill is safe (it doesn't alter query flow).
-
           # wp_die polyfill: real WordPress provides wp_die(); the unit-test
-          # bootstrap doesn't, so 21 tests hit an 'undefined function' error
-          # when a driver error path tries to call it.
+          # bootstrap doesn't, so tests hit an 'undefined function' error when
+          # a driver error path tries to call it.
           path = 'tests/bootstrap.php'
           src = open(path).read()
           marker = "if ( ! function_exists( 'do_action' ) ) {"
