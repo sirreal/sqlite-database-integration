@@ -181,15 +181,169 @@ jobs:
           extern void sqlite3_result_int64(sqlite3_context *ctx, long long v);
           void sqlite3_result_int(sqlite3_context *ctx, int v) { sqlite3_result_int64(ctx, (long long)v); }
 
-          // SQLite's own formatting API. Turso doesn't export it, so without a
-          // shim pdo_sqlite falls through to system libsqlite3, where these
-          // functions interact badly with Turso's malloc/free and crash.
-          // This implementation is libc-based and ignores SQLite's %q / %Q
-          // format specifiers (used for SQL-quoting); pdo_sqlite uses the
-          // plain %s family for error message formatting, which is handled.
+          // SQLite's own formatting API. Turso doesn't export it. A naive
+          // libc-only wrapper breaks because SQLite defines extra conversion
+          // specifiers (%q, %Q, %w) that libc vsnprintf doesn't understand —
+          // in particular, pdo_sqlite's quote() uses sqlite3_mprintf("'%q'",s),
+          // so without %q support every quoted value becomes garbled. This
+          // implementation parses the format itself, handles the SQLite
+          // extensions explicitly, and delegates standard specifiers to libc.
+          struct buf { char *p; size_t len, cap; };
+
+          static int buf_append(struct buf *b, const char *s, size_t n) {
+              if (b->len + n + 1 > b->cap) {
+                  size_t new_cap = b->cap ? b->cap * 2 : 64;
+                  while (new_cap < b->len + n + 1) new_cap *= 2;
+                  char *np = (char *)realloc(b->p, new_cap);
+                  if (!np) return -1;
+                  b->p = np;
+                  b->cap = new_cap;
+              }
+              memcpy(b->p + b->len, s, n);
+              b->len += n;
+              b->p[b->len] = '\0';
+              return 0;
+          }
+
+          static int buf_append_c(struct buf *b, char c) { return buf_append(b, &c, 1); }
+
+          static int buf_append_quoted(struct buf *b, const char *s, char q) {
+              for (; *s; s++) {
+                  if (*s == q && buf_append_c(b, q) < 0) return -1;
+                  if (buf_append_c(b, *s) < 0) return -1;
+              }
+              return 0;
+          }
+
+          // Build a result string by parsing fmt and consuming ap as needed.
+          static char *vmprintf_impl(const char *fmt, va_list ap) {
+              struct buf b = {0};
+
+              while (*fmt) {
+                  if (*fmt != '%') {
+                      if (buf_append_c(&b, *fmt++) < 0) { free(b.p); return NULL; }
+                      continue;
+                  }
+                  const char *spec_start = fmt;
+                  fmt++;
+                  // Flags, width, precision, length — collected for libc fallback.
+                  while (*fmt && strchr("-+ #0'", *fmt)) fmt++;
+                  while (*fmt == '*') { va_arg(ap, int); fmt++; }
+                  while (*fmt && *fmt >= '0' && *fmt <= '9') fmt++;
+                  if (*fmt == '.') {
+                      fmt++;
+                      if (*fmt == '*') { va_arg(ap, int); fmt++; }
+                      while (*fmt && *fmt >= '0' && *fmt <= '9') fmt++;
+                  }
+                  int is_long = 0, is_long_long = 0;
+                  while (*fmt && strchr("hljztL", *fmt)) {
+                      if (*fmt == 'l') { if (is_long) is_long_long = 1; else is_long = 1; }
+                      if (*fmt == 'j' || *fmt == 'z') is_long_long = 1;
+                      fmt++;
+                  }
+                  char conv = *fmt;
+                  if (!conv) break;
+                  fmt++;
+
+                  if (conv == 'q' || conv == 'Q' || conv == 'w') {
+                      const char *arg = va_arg(ap, const char *);
+                      if (conv == 'Q' && !arg) {
+                          if (buf_append(&b, "NULL", 4) < 0) { free(b.p); return NULL; }
+                      } else {
+                          char qchar = (conv == 'w') ? '"' : '\'';
+                          if (conv == 'Q' && buf_append_c(&b, qchar) < 0) { free(b.p); return NULL; }
+                          if (arg && buf_append_quoted(&b, arg, qchar) < 0) { free(b.p); return NULL; }
+                          if (conv == 'Q' && buf_append_c(&b, qchar) < 0) { free(b.p); return NULL; }
+                      }
+                      continue;
+                  }
+
+                  // Standard conversion — rebuild the spec and call libc snprintf
+                  // for the single specifier, then append the result.
+                  size_t speclen = (size_t)(fmt - spec_start);
+                  char spec[64];
+                  if (speclen + 1 > sizeof spec) speclen = sizeof spec - 1;
+                  memcpy(spec, spec_start, speclen);
+                  spec[speclen] = '\0';
+
+                  char tmp[128];
+                  char *out = tmp;
+                  int n = 0;
+                  if (conv == 's' || conv == 'z') {
+                      const char *a = va_arg(ap, const char *);
+                      n = snprintf(tmp, sizeof tmp, spec, a ? a : "(null)");
+                      if (n >= (int)sizeof tmp) {
+                          out = (char *)malloc((size_t)n + 1);
+                          if (!out) { free(b.p); return NULL; }
+                          snprintf(out, (size_t)n + 1, spec, a ? a : "(null)");
+                      }
+                      if (conv == 'z' && a) free((void *)a);
+                  } else if (conv == 'c') {
+                      int a = va_arg(ap, int);
+                      n = snprintf(tmp, sizeof tmp, spec, a);
+                  } else if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' ||
+                             conv == 'X' || conv == 'o') {
+                      if (is_long_long) {
+                          long long a = va_arg(ap, long long);
+                          n = snprintf(tmp, sizeof tmp, spec, a);
+                      } else if (is_long) {
+                          long a = va_arg(ap, long);
+                          n = snprintf(tmp, sizeof tmp, spec, a);
+                      } else {
+                          int a = va_arg(ap, int);
+                          n = snprintf(tmp, sizeof tmp, spec, a);
+                      }
+                  } else if (conv == 'e' || conv == 'E' || conv == 'f' || conv == 'F' ||
+                             conv == 'g' || conv == 'G') {
+                      double a = va_arg(ap, double);
+                      n = snprintf(tmp, sizeof tmp, spec, a);
+                  } else if (conv == 'p') {
+                      void *a = va_arg(ap, void *);
+                      n = snprintf(tmp, sizeof tmp, spec, a);
+                  } else if (conv == '%') {
+                      tmp[0] = '%'; tmp[1] = '\0'; n = 1;
+                  } else {
+                      // Unknown specifier — pass through literally.
+                      memcpy(tmp, spec_start, speclen);
+                      tmp[speclen] = '\0';
+                      n = (int)speclen;
+                  }
+
+                  if (n > 0 && buf_append(&b, out, (size_t)n) < 0) {
+                      if (out != tmp) free(out);
+                      free(b.p);
+                      return NULL;
+                  }
+                  if (out != tmp) free(out);
+              }
+              if (!b.p) {
+                  b.p = (char *)malloc(1);
+                  if (b.p) b.p[0] = '\0';
+              }
+              return b.p;
+          }
+
+          char *sqlite3_vmprintf(const char *fmt, va_list ap) {
+              return vmprintf_impl(fmt, ap);
+          }
+
+          char *sqlite3_mprintf(const char *fmt, ...) {
+              va_list ap;
+              va_start(ap, fmt);
+              char *s = vmprintf_impl(fmt, ap);
+              va_end(ap);
+              return s;
+          }
+
           char *sqlite3_vsnprintf(int n, char *dst, const char *fmt, va_list ap) {
               if (!dst || n <= 0) return dst;
-              vsnprintf(dst, (size_t)n, fmt, ap);
+              char *s = vmprintf_impl(fmt, ap);
+              if (!s) { dst[0] = '\0'; return dst; }
+              size_t copy = strlen(s);
+              if (copy > (size_t)(n - 1)) copy = (size_t)(n - 1);
+              memcpy(dst, s, copy);
+              dst[copy] = '\0';
+              free(s);
               return dst;
           }
 
@@ -199,26 +353,6 @@ jobs:
               sqlite3_vsnprintf(n, dst, fmt, ap);
               va_end(ap);
               return dst;
-          }
-
-          char *sqlite3_vmprintf(const char *fmt, va_list ap) {
-              va_list ap2;
-              va_copy(ap2, ap);
-              int len = vsnprintf(NULL, 0, fmt, ap2);
-              va_end(ap2);
-              if (len < 0) return NULL;
-              char *buf = (char *)malloc((size_t)len + 1);
-              if (!buf) return NULL;
-              vsnprintf(buf, (size_t)len + 1, fmt, ap);
-              return buf;
-          }
-
-          char *sqlite3_mprintf(const char *fmt, ...) {
-              va_list ap;
-              va_start(ap, fmt);
-              char *s = sqlite3_vmprintf(fmt, ap);
-              va_end(ap);
-              return s;
           }
           C
 
