@@ -72,6 +72,77 @@ jobs:
           echo '--- Sample of exported sqlite3_* symbols ---'
           nm -D --defined-only "$LIB" | awk '$3 ~ /^sqlite3_/ {print $3}' | sort | head -20
 
+      # Turso only exports the _v2 variants of several functions, but PHP's
+      # pdo_sqlite calls the older names (sqlite3_create_function, sqlite3_prepare,
+      # etc.). Without an override, those symbols fall through to the system
+      # libsqlite3 at runtime, which then operates on a Turso-allocated handle
+      # and segfaults. This shim provides the missing names as thin wrappers
+      # that delegate to the _v2 variants; LD_PRELOAD'd before Turso, it makes
+      # pdo_sqlite see a complete sqlite3 C API backed entirely by Turso.
+      - name: Build pdo_sqlite compatibility shim
+        id: shim
+        run: |
+          cat > /tmp/turso-compat-shim.c <<'C'
+          typedef struct sqlite3 sqlite3;
+          typedef struct sqlite3_stmt sqlite3_stmt;
+          typedef struct sqlite3_value sqlite3_value;
+          typedef struct sqlite3_context sqlite3_context;
+
+          extern int sqlite3_create_function_v2(
+              sqlite3 *db, const char *name, int n_arg, int enc, void *app,
+              void (*x_func)(sqlite3_context*, int, sqlite3_value**),
+              void (*x_step)(sqlite3_context*, int, sqlite3_value**),
+              void (*x_final)(sqlite3_context*),
+              void (*x_destroy)(void*));
+
+          int sqlite3_create_function(
+              sqlite3 *db, const char *name, int n_arg, int enc, void *app,
+              void (*x_func)(sqlite3_context*, int, sqlite3_value**),
+              void (*x_step)(sqlite3_context*, int, sqlite3_value**),
+              void (*x_final)(sqlite3_context*))
+          {
+              return sqlite3_create_function_v2(db, name, n_arg, enc, app,
+                                                x_func, x_step, x_final, 0);
+          }
+
+          extern int sqlite3_prepare_v2(sqlite3 *db, const char *sql, int nbytes,
+              sqlite3_stmt **out_stmt, const char **tail);
+
+          int sqlite3_prepare(sqlite3 *db, const char *sql, int nbytes,
+              sqlite3_stmt **out_stmt, const char **tail)
+          {
+              return sqlite3_prepare_v2(db, sql, nbytes, out_stmt, tail);
+          }
+
+          extern int sqlite3_create_collation_v2(sqlite3 *db, const char *name,
+              int enc, void *ctx,
+              int (*cmp)(void*, int, const void*, int, const void*),
+              void (*destroy)(void*));
+
+          int sqlite3_create_collation(sqlite3 *db, const char *name, int enc,
+              void *ctx,
+              int (*cmp)(void*, int, const void*, int, const void*))
+          {
+              return sqlite3_create_collation_v2(db, name, enc, ctx, cmp, 0);
+          }
+
+          extern long long sqlite3_value_int64(sqlite3_value *v);
+          int sqlite3_value_int(sqlite3_value *v) { return (int)sqlite3_value_int64(v); }
+
+          extern void sqlite3_result_int64(sqlite3_context *ctx, long long v);
+          void sqlite3_result_int(sqlite3_context *ctx, int v) { sqlite3_result_int64(ctx, (long long)v); }
+          C
+
+          SHIM=/tmp/libturso-compat-shim.so
+          gcc -shared -fPIC -Wall -O2 -o "$SHIM" /tmp/turso-compat-shim.c
+          echo "Shim library: $SHIM"
+          nm -D --defined-only "$SHIM" | awk '$3 ~ /^sqlite3_/ {print $3}'
+          echo "path=$SHIM" >> "$GITHUB_OUTPUT"
+
+      - name: Combine LD_PRELOAD paths
+        id: preload
+        run: echo "value=${{ steps.shim.outputs.path }}:${{ steps.turso-lib.outputs.path }}" >> "$GITHUB_OUTPUT"
+
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
         with:
@@ -81,7 +152,7 @@ jobs:
       - name: Smoke-test pdo_sqlite against Turso
         continue-on-error: true
         env:
-          LD_PRELOAD: ${{ steps.turso-lib.outputs.path }}
+          LD_PRELOAD: ${{ steps.preload.outputs.value }}
         run: |
           php <<'PHP'
           <?php
@@ -131,7 +202,7 @@ jobs:
         env:
           # Intentionally NOT setting LD_PRELOAD at step level — we enable it
           # only inside the script so gdb itself doesn't link against Turso.
-          TURSO_LIB: ${{ steps.turso-lib.outputs.path }}
+          PRELOAD: ${{ steps.preload.outputs.value }}
         working-directory: packages/mysql-on-sqlite
         run: |
           # Progress logging goes to STDERR so it's line-buffered and flushed
@@ -197,7 +268,7 @@ jobs:
           gdb -batch \
               -ex "set confirm off" \
               -ex "set pagination off" \
-              -ex "set environment LD_PRELOAD=$TURSO_LIB" \
+              -ex "set environment LD_PRELOAD=$PRELOAD" \
               -ex "run /tmp/diag.php" \
               -ex "bt" \
               --args "$(command -v php)"
@@ -205,6 +276,6 @@ jobs:
       - name: Run PHPUnit tests against Turso DB
         continue-on-error: true
         env:
-          LD_PRELOAD: ${{ steps.turso-lib.outputs.path }}
+          LD_PRELOAD: ${{ steps.preload.outputs.value }}
         working-directory: packages/mysql-on-sqlite
         run: php ./vendor/bin/phpunit -c ./phpunit.xml.dist
