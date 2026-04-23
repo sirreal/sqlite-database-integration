@@ -39,10 +39,24 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             turso/target
-          key: turso-${{ runner.os }}-${{ steps.turso.outputs.tag }}
+          key: turso-${{ runner.os }}-${{ steps.turso.outputs.tag }}-${{ hashFiles('.github/workflows/phpunit-tests-turso.yml') }}
 
       - name: Clone Turso source
         run: git clone --depth 1 --branch '${{ steps.turso.outputs.tag }}' https://github.com/tursodatabase/turso.git
+
+      # Turso's stub!() macro expands to a `todo!()` that panics across the FFI
+      # boundary and aborts the PHP process. That blocks any call into a not-yet-
+      # implemented sqlite3_* function — e.g. sqlite3_set_authorizer, which
+      # PHP's pdo_sqlite calls during PDO construction. Rewrite the macro so
+      # stubbed functions return a zeroed value of their return type instead
+      # (0 / SQLITE_OK for ints, NULL for pointers). This lets the driver reach
+      # functions Turso does implement, so PHPUnit can produce a real report.
+      - name: Patch Turso stub macro to not abort
+        working-directory: turso
+        run: |
+          sed -i 's|todo!("{} is not implemented", stringify!($fn));|return unsafe { std::mem::zeroed() };|' sqlite3/src/lib.rs
+          echo '--- Patched stub! macro ---'
+          sed -n '/macro_rules! stub/,/^}$/p' sqlite3/src/lib.rs
 
       - name: Build turso_sqlite3 shared library
         working-directory: turso
