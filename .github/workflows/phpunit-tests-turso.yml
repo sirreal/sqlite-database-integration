@@ -586,9 +586,15 @@ jobs:
         # any <error> or <failure>, the step fails.
         run: |
           set +e
-          timeout --kill-after=10 600 \
+          # Tests known to hang against Turso main (pinned commit). The ALTER
+          # TABLE flow emits CREATE TABLE + INSERT SELECT + DROP + RENAME with
+          # a NOT NULL column on the new table; Turso hangs on one of those.
+          # Skip via a negative-lookahead --filter.
+          skip_regex='^(?!WP_SQLite_Driver_Translation_Tests::testAlterTableAddColumnWithNotNull$).+'
+          timeout --kill-after=10 180 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --debug \
+                  --filter "$skip_regex" \
                   --log-junit /tmp/phpunit-turso.xml
           ec=$?
           if [ ! -s /tmp/phpunit-turso.xml ]; then
