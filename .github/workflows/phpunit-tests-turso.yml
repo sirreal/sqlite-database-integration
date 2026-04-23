@@ -123,14 +123,21 @@ jobs:
           ignore-cache: "yes"
           composer-options: "--optimize-autoloader"
 
+      - name: Install gdb
+        run: sudo apt-get install -y --no-install-recommends gdb
+
       - name: Diagnose createFunction behavior
         continue-on-error: true
         env:
-          LD_PRELOAD: ${{ steps.turso-lib.outputs.path }}
+          # Intentionally NOT setting LD_PRELOAD at step level — we enable it
+          # only inside the script so gdb itself doesn't link against Turso.
+          TURSO_LIB: ${{ steps.turso-lib.outputs.path }}
         working-directory: packages/mysql-on-sqlite
         run: |
-          # Use STDERR for progress logging so it is always flushed immediately.
-          php <<'PHP'
+          # Progress logging goes to STDERR so it's line-buffered and flushed
+          # before any crash. The PHP script is run under gdb so we get a
+          # backtrace if it segfaults.
+          cat > /tmp/diag.php <<'PHP'
           <?php
           $log = fn(string $s) => fwrite(STDERR, $s . "\n");
 
@@ -186,6 +193,14 @@ jobs:
 
           $log('[done] script finished cleanly');
           PHP
+
+          gdb -batch \
+              -ex "set confirm off" \
+              -ex "set pagination off" \
+              -ex "set environment LD_PRELOAD=$TURSO_LIB" \
+              -ex "run /tmp/diag.php" \
+              -ex "bt" \
+              --args "$(command -v php)"
 
       - name: Run PHPUnit tests against Turso DB
         continue-on-error: true
