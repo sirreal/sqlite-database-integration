@@ -458,77 +458,14 @@ jobs:
           assert old in src, 'temporary_table_exists body not found'
           src = src.replace(old, new, 1)
 
-          # 2. Turso's UPDATE statement doesn't accept row-value assignment from
-          #    a subquery (`SET (a, b) = (SELECT ...)`). Rewrite the single query
-          #    in sync_column_key_info as two correlated subqueries, one per
-          #    target column.
-          old = (
-              "\t\t$this->connection->query(\n"
-              "\t\t\t'\n"
-              "\t\t\t\tUPDATE ' . $this->connection->quote_identifier( $columns_table_name ) . \" AS c\n"
-              "\t\t\t\tSET (column_key, is_nullable) = (\n"
-              "\t\t\t\t\tSELECT\n"
-              "\t\t\t\t\t\tCASE\n"
-              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'PRI'\n"
-              "\t\t\t\t\t\t\tWHEN MAX(s.non_unique = 0 AND s.seq_in_index = 1) THEN 'UNI'\n"
-              "\t\t\t\t\t\t\tWHEN MAX(s.seq_in_index = 1) THEN 'MUL'\n"
-              "\t\t\t\t\t\t\tELSE ''\n"
-              "\t\t\t\t\t\tEND,\n"
-              "\t\t\t\t\t\tCASE\n"
-              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'NO'\n"
-              "\t\t\t\t\t\t\tELSE c.is_nullable\n"
-              "\t\t\t\t\t\tEND\n"
-              "\t\t\t\t\tFROM \" . $this->connection->quote_identifier( $statistics_table_name ) . ' AS s\n"
-              "\t\t\t\t\tWHERE s.table_schema = c.table_schema\n"
-              "\t\t\t\t\tAND s.table_name = c.table_name\n"
-              "\t\t\t\t\tAND s.column_name = c.column_name\n"
-              "\t\t\t\t)\n"
-              "\t\t\t    WHERE c.table_schema = ?\n"
-              "\t\t\t    AND c.table_name = ?\n"
-              "\t\t\t',\n"
-              "\t\t\tarray( self::SAVED_DATABASE_NAME, $table_name )\n"
-              "\t\t);"
-          )
-          assert old in src, 'sync_column_key_info UPDATE not found'
-          new = "\n".join([
-              "\t\t$columns_table    = $this->connection->quote_identifier( $columns_table_name );",
-              "\t\t$statistics_table = $this->connection->quote_identifier( $statistics_table_name );",
-              "\t\t$this->connection->query(",
-              "\t\t\t\"",
-              "\t\t\t\tUPDATE $columns_table AS c",
-              "\t\t\t\tSET column_key = (",
-              "\t\t\t\t\tSELECT",
-              "\t\t\t\t\t\tCASE",
-              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'PRI'",
-              "\t\t\t\t\t\t\tWHEN MAX(s.non_unique = 0 AND s.seq_in_index = 1) THEN 'UNI'",
-              "\t\t\t\t\t\t\tWHEN MAX(s.seq_in_index = 1) THEN 'MUL'",
-              "\t\t\t\t\t\t\tELSE ''",
-              "\t\t\t\t\t\tEND",
-              "\t\t\t\t\tFROM $statistics_table AS s",
-              "\t\t\t\t\tWHERE s.table_schema = c.table_schema",
-              "\t\t\t\t\tAND s.table_name = c.table_name",
-              "\t\t\t\t\tAND s.column_name = c.column_name",
-              "\t\t\t\t),",
-              "\t\t\t\tis_nullable = (",
-              "\t\t\t\t\tSELECT",
-              "\t\t\t\t\t\tCASE",
-              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'NO'",
-              "\t\t\t\t\t\t\tELSE c.is_nullable",
-              "\t\t\t\t\t\tEND",
-              "\t\t\t\t\tFROM $statistics_table AS s",
-              "\t\t\t\t\tWHERE s.table_schema = c.table_schema",
-              "\t\t\t\t\tAND s.table_name = c.table_name",
-              "\t\t\t\t\tAND s.column_name = c.column_name",
-              "\t\t\t\t)",
-              "\t\t\t\tWHERE c.table_schema = ?",
-              "\t\t\t\tAND c.table_name = ?",
-              "\t\t\t\",",
-              "\t\t\tarray( self::SAVED_DATABASE_NAME, $table_name )",
-              "\t\t);",
-          ])
-          src = src.replace(old, new, 1)
+          # (Earlier attempt also rewrote sync_column_key_info's UPDATE to
+          # work around Turso's lack of row-value assignment from a subquery,
+          # but the rewrite caused PHPUnit to hang indefinitely on a specific
+          # test around position 504/667 — likely a pathological case in
+          # Turso's query planner. Dropped for now; the 40 affected tests
+          # remain errors.)
           open(path, 'w').write(src)
-          print('patched information-schema-builder.php')
+          print('patched information-schema-builder.php (temporary_table_exists only)')
 
           # 3. wp_die polyfill: 21 tests hit an error path in the driver that
           #    calls wp_die(). Real WordPress provides it; the unit-test bootstrap
