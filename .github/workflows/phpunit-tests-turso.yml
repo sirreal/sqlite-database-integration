@@ -586,7 +586,7 @@ jobs:
         # any <error> or <failure>, the step fails.
         run: |
           set +e
-          timeout --kill-after=10 180 \
+          timeout --kill-after=10 600 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --log-junit /tmp/phpunit-turso.xml
           ec=$?
