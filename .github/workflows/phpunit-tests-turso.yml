@@ -420,6 +420,133 @@ jobs:
       - name: Install gdb
         run: sudo apt-get install -y --no-install-recommends gdb
 
+      # These patches to the driver work around Turso behaviours that the SQL
+      # layer in this repo currently assumes. Each is a localised rewrite so
+      # the driver still produces correct behaviour when run against Turso;
+      # they are not behaviour changes for real SQLite.
+      - name: Patch driver for Turso compatibility
+        working-directory: packages/mysql-on-sqlite
+        run: |
+          python3 - <<'PY'
+          import re
+
+          # 1. Turso doesn't expose `sqlite_temp_master`. The driver queries it
+          #    to decide whether to use temp-schema tables, but Turso doesn't
+          #    support TEMP tables at all, so the predicate is always false.
+          path = 'src/sqlite/class-wp-sqlite-information-schema-builder.php'
+          src = open(path).read()
+          old = (
+              "\tpublic function temporary_table_exists( string $table_name ): bool {\n"
+              "\t\t/*\n"
+              "\t\t * We could search in the \"{$this->temporary_table_prefix}tables\" table,\n"
+              "\t\t * but it may not exist yet, so using \"sqlite_temp_master\" is simpler.\n"
+              "\t\t */\n"
+              "\t\t$stmt = $this->connection->query(\n"
+              "\t\t\t\"SELECT 1 FROM sqlite_temp_master WHERE type = 'table' AND name = ?\",\n"
+              "\t\t\tarray( $table_name )\n"
+              "\t\t);\n"
+              "\t\treturn $stmt->fetchColumn() === '1';\n"
+              "\t}"
+          )
+          new = (
+              "\tpublic function temporary_table_exists( string $table_name ): bool {\n"
+              "\t\t// Turso compatibility: it does not support TEMP tables or\n"
+              "\t\t// expose sqlite_temp_master, so this is always false.\n"
+              "\t\treturn false;\n"
+              "\t}"
+          )
+          assert old in src, 'temporary_table_exists body not found'
+          src = src.replace(old, new, 1)
+
+          # 2. Turso's UPDATE statement doesn't accept row-value assignment from
+          #    a subquery (`SET (a, b) = (SELECT ...)`). Rewrite the single query
+          #    in sync_column_key_info as two correlated subqueries, one per
+          #    target column.
+          old = (
+              "\t\t$this->connection->query(\n"
+              "\t\t\t'\n"
+              "\t\t\t\tUPDATE ' . $this->connection->quote_identifier( $columns_table_name ) . \" AS c\n"
+              "\t\t\t\tSET (column_key, is_nullable) = (\n"
+              "\t\t\t\t\tSELECT\n"
+              "\t\t\t\t\t\tCASE\n"
+              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'PRI'\n"
+              "\t\t\t\t\t\t\tWHEN MAX(s.non_unique = 0 AND s.seq_in_index = 1) THEN 'UNI'\n"
+              "\t\t\t\t\t\t\tWHEN MAX(s.seq_in_index = 1) THEN 'MUL'\n"
+              "\t\t\t\t\t\t\tELSE ''\n"
+              "\t\t\t\t\t\tEND,\n"
+              "\t\t\t\t\t\tCASE\n"
+              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'NO'\n"
+              "\t\t\t\t\t\t\tELSE c.is_nullable\n"
+              "\t\t\t\t\t\tEND\n"
+              "\t\t\t\t\tFROM \" . $this->connection->quote_identifier( $statistics_table_name ) . ' AS s\n"
+              "\t\t\t\t\tWHERE s.table_schema = c.table_schema\n"
+              "\t\t\t\t\tAND s.table_name = c.table_name\n"
+              "\t\t\t\t\tAND s.column_name = c.column_name\n"
+              "\t\t\t\t)\n"
+              "\t\t\t    WHERE c.table_schema = ?\n"
+              "\t\t\t    AND c.table_name = ?\n"
+              "\t\t\t',\n"
+              "\t\t\tarray( self::SAVED_DATABASE_NAME, $table_name )\n"
+              "\t\t);"
+          )
+          assert old in src, 'sync_column_key_info UPDATE not found'
+          new = '''		$columns_table = $this->connection->quote_identifier( $columns_table_name );
+		$statistics_table = $this->connection->quote_identifier( $statistics_table_name );
+		$this->connection->query(
+			"
+				UPDATE $columns_table AS c
+				SET column_key = (
+					SELECT
+						CASE
+							WHEN MAX(s.index_name = 'PRIMARY') THEN 'PRI'
+							WHEN MAX(s.non_unique = 0 AND s.seq_in_index = 1) THEN 'UNI'
+							WHEN MAX(s.seq_in_index = 1) THEN 'MUL'
+							ELSE ''
+						END
+					FROM $statistics_table AS s
+					WHERE s.table_schema = c.table_schema
+					AND s.table_name = c.table_name
+					AND s.column_name = c.column_name
+				),
+				is_nullable = (
+					SELECT
+						CASE
+							WHEN MAX(s.index_name = 'PRIMARY') THEN 'NO'
+							ELSE c.is_nullable
+						END
+					FROM $statistics_table AS s
+					WHERE s.table_schema = c.table_schema
+					AND s.table_name = c.table_name
+					AND s.column_name = c.column_name
+				)
+				WHERE c.table_schema = ?
+				AND c.table_name = ?
+			",
+			array( self::SAVED_DATABASE_NAME, $table_name )
+		);'''
+          src = src.replace(old, new, 1)
+          open(path, 'w').write(src)
+          print('patched information-schema-builder.php')
+
+          # 3. wp_die polyfill: 21 tests hit an error path in the driver that
+          #    calls wp_die(). Real WordPress provides it; the unit-test bootstrap
+          #    does not. Add a minimal polyfill.
+          path = 'tests/bootstrap.php'
+          src = open(path).read()
+          marker = "if ( ! function_exists( 'do_action' ) ) {"
+          inject = (
+              "if ( ! function_exists( 'wp_die' ) ) {\n"
+              "\tfunction wp_die( $message = '', $title = '', $args = array() ) {\n"
+              "\t\tthrow new \\RuntimeException( is_string( $message ) ? $message : 'wp_die' );\n"
+              "\t}\n"
+              "}\n\n"
+          )
+          assert marker in src
+          src = src.replace(marker, inject + marker, 1)
+          open(path, 'w').write(src)
+          print('added wp_die polyfill to bootstrap.php')
+          PY
+
       - name: Capture failing SQL from the first failing driver test
         continue-on-error: true
         env:
