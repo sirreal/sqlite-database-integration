@@ -896,6 +896,37 @@ jobs:
               -ex "bt 40" \
               --args "$(command -v php)" || true
 
+      - name: Probe testReconstructTable in isolation
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.preload.outputs.value }}
+        working-directory: packages/mysql-on-sqlite
+        # Run just this one test by itself. Previous runs show it hangs at
+        # ~10 min when executed after the other tests. If it passes here in
+        # ~1 s, the hang is caused by accumulated process state from the
+        # preceding tests (likely leaked FuncSlot p_app refs).
+        run: |
+          set +e
+          timeout --kill-after=10 60 \
+              php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
+                  --filter '^WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable$'
+          echo "testReconstructTable isolated exit: $?"
+
+      - name: Probe testReconstructTable after Translation_Tests
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.preload.outputs.value }}
+        working-directory: packages/mysql-on-sqlite
+        # Run Translation_Tests then testReconstructTable in one process.
+        # If this hangs, Translation_Tests specifically are leaving Turso in
+        # a bad state. If it passes, the trigger is something earlier.
+        run: |
+          set +e
+          timeout --kill-after=10 180 \
+              php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
+                  --filter '^(WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable)'
+          echo "Translation+reconstruct exit: $?"
+
       - name: Run PHPUnit tests against Turso DB
         env:
           LD_PRELOAD: ${{ steps.preload.outputs.value }}
@@ -908,17 +939,15 @@ jobs:
         # any <error> or <failure>, the step fails.
         run: |
           set +e
-          # Skipped for this run:
-          #   - WP_SQLite_Driver_Translation_Tests: several cases hang Turso
-          #     (ALTER TABLE flow, BOOLEAN columns, etc.). 57 tests.
-          #   - WP_MySQL_Server_Suite_Lexer_Tests: tokenises a 5.7 MB CSV in
-          #     a single PHP loop; hangs past our 10-minute step budget on
-          #     this runner. Pure PHP (doesn't touch Turso), skipping until
-          #     it can run in its own process.
-          # Only the two CSV-driven server-suite tests remain skipped — they
-          # tokenize/parse a 5.7 MB fixture in a single loop and run for well
-          # over 10 min under LD_PRELOAD (not a Turso issue).
-          skip_regex='^(?!WP_MySQL_Server_Suite_).+'
+          # Currently skipped:
+          #   - WP_MySQL_Server_Suite_*: tokenise/parse a 5.7 MB fixture in a
+          #     single loop, runs well over 10 min under LD_PRELOAD (not a
+          #     Turso issue; pure PHP work).
+          #   - WP_SQLite_Driver_Translation_Tests: all 56 tests complete,
+          #     but leave Turso in a state where the next test hangs
+          #     (testReconstructTable 10-min timeout). Re-skip until the
+          #     state-leak is understood.
+          skip_regex='^(?!WP_MySQL_Server_Suite_|WP_SQLite_Driver_Translation_Tests).+'
           timeout --kill-after=10 600 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --debug \
