@@ -1160,6 +1160,21 @@ jobs:
           open(path, 'w').write(new_src)
           print(f'patched {n} Translation_Tests VALUES expectations to SELECT form')
 
+          # 14. Update Translation_Tests::testHexadecimalLiterals to match
+          #     the hex-literal alias force patch (which needs to stay so
+          #     Turso doesn't mangle x'417a' into 17a' at runtime).
+          src = open(path).read()
+          for old_q, new_q in [
+              ("\"SELECT x'417a'\",\n\t\t\t\"SELECT x'417a'\"",
+               "\"SELECT x'417a' AS `x'417a'`\",\n\t\t\t\"SELECT x'417a'\""),
+              ("\"SELECT X'417a'\",\n\t\t\t\"SELECT X'417a'\"",
+               "\"SELECT X'417a' AS `X'417a'`\",\n\t\t\t\"SELECT X'417a'\""),
+          ]:
+              assert old_q in src, f'hex literal expectation not found: {old_q!r}'
+              src = src.replace(old_q, new_q, 1)
+          open(path, 'w').write(src)
+          print('patched Translation_Tests testHexadecimalLiterals expectations')
+
           # 11. 6 Translation_Tests assert on the exact SQL emitted by
           #     sync_column_key_info. Our EXISTS rewrite (needed because
           #     Turso doesn't implement SQLite's "bare column alongside
