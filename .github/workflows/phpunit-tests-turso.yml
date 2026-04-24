@@ -775,9 +775,9 @@ jobs:
           // 5) Reproduce the actual testFromBase64Function setup exactly: run
           //    setUp-style driver construction and then call FROM_BASE64.
           try {
+              require getcwd() . '/tests/bootstrap.php';
               $pdo2 = new PDO\SQLite('sqlite::memory:');
               $pdo2->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-              require __DIR__ . '/tests/bootstrap.php';
               $engine = new WP_SQLite_Driver(new WP_SQLite_Connection(['pdo' => $pdo2]), 'wp');
               $log('[f] driver constructed');
               $r = $engine->query("SELECT FROM_BASE64('SGVsbG8gV29ybGQ=') AS decoded");
