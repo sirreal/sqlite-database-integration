@@ -756,29 +756,32 @@ jobs:
               $log('[d] EXC ' . $e->getMessage());
           }
 
-          // 4) Register many to see if limit matters.
+          // 4) Register 50 and CALL each — not just registration. Turso's
+          //    pre-generated bridges used to be capped at 32 slots; we
+          //    expanded to 64, but need to verify slots 32+ actually dispatch.
           try {
-              for ($i = 0; $i < 40; $i++) {
-                  $pdo->createFunction("fn_{$i}", function () { return 1; });
-                  if ($i === 30 || $i === 31 || $i === 32 || $i === 33 || $i === 39) {
-                      $log("[e.{$i}] registered fn_{$i}");
-                  }
+              for ($i = 0; $i < 50; $i++) {
+                  $pdo->createFunction("fn_{$i}", function () use ($i) { return "v$i"; });
               }
-              $log('[e] bulk registration ok');
+              $log('[e] registered 50 UDFs ok');
+              foreach ([0, 31, 32, 33, 49] as $i) {
+                  $r = $pdo->query("SELECT fn_{$i}() AS v")->fetch(PDO::FETCH_ASSOC);
+                  $log("[e.call {$i}] " . json_encode($r));
+              }
           } catch (\Throwable $e) {
-              $log('[e] EXC at N=' . ($i ?? '?') . ': ' . $e->getMessage());
+              $log('[e] EXC: ' . $e->getMessage());
           }
 
           $log('[done] script finished cleanly');
           PHP
 
-          gdb -batch \
+          timeout --kill-after=5 60 gdb -batch \
               -ex "set confirm off" \
               -ex "set pagination off" \
               -ex "set environment LD_PRELOAD=$PRELOAD" \
               -ex "run /tmp/diag.php" \
               -ex "bt" \
-              --args "$(command -v php)"
+              --args "$(command -v php)" || true
 
       - name: Run PHPUnit tests against Turso DB
         env:
