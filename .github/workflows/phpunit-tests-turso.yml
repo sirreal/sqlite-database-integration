@@ -915,9 +915,10 @@ jobs:
           #     a single PHP loop; hangs past our 10-minute step budget on
           #     this runner. Pure PHP (doesn't touch Turso), skipping until
           #     it can run in its own process.
-          # Still skipping base64 tests for the main run until the hang is
-          # understood (see preceding gdb step).
-          skip_regex='^(?!WP_MySQL_Server_Suite_|WP_SQLite_Driver_Tests::testFromBase64Function|WP_SQLite_Driver_Tests::testToBase64Function).+'
+          # Only the two CSV-driven server-suite tests remain skipped — they
+          # tokenize/parse a 5.7 MB fixture in a single loop and run for well
+          # over 10 min under LD_PRELOAD (not a Turso issue).
+          skip_regex='^(?!WP_MySQL_Server_Suite_).+'
           timeout --kill-after=10 600 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --debug \
