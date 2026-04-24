@@ -205,6 +205,110 @@ jobs:
           print('patched slot-reuse destroy invocation')
           PY_FIX_DESTROY
 
+          # sqlite3_finalize uses a non-reentrant std::sync::Mutex on the db.
+          # PHP's cycle GC can fire a PDO statement destructor while another
+          # statement's sqlite3_step is in progress (i.e., from inside a UDF
+          # callback whose bridge re-enters PHP). The outer step holds the
+          # mutex, the inner finalize blocks on it, and we deadlock.
+          #
+          # Fix: use try_lock; on contention, skip the stmt_list unlink and
+          # the drain. The list is only traversed by sqlite3_next_stmt (which
+          # pdo_sqlite doesn't call) and dropped on sqlite3_close, so a stale
+          # entry is harmless; the stmt's own Box is still freed below.
+          python3 - <<'PY_FIX_FINALIZE'
+          p = 'sqlite3/src/lib.rs'
+          s = open(p).read()
+          old = (
+              "    if !stmt_ref.db.is_null() {\n"
+              "        let db = &mut *stmt_ref.db;\n"
+              "        let mut db_inner = db.inner.lock().unwrap();\n"
+              "\n"
+              "        if db_inner.stmt_list == stmt {\n"
+              "            db_inner.stmt_list = stmt_ref.next;\n"
+              "        } else {\n"
+              "            let mut current = db_inner.stmt_list;\n"
+              "            while !current.is_null() {\n"
+              "                let current_ref = &mut *current;\n"
+              "                if current_ref.next == stmt {\n"
+              "                    current_ref.next = stmt_ref.next;\n"
+              "                    break;\n"
+              "                }\n"
+              "                current = current_ref.next;\n"
+              "            }\n"
+              "        }\n"
+              "    }\n"
+          )
+          new = (
+              "    if !stmt_ref.db.is_null() {\n"
+              "        let db = &mut *stmt_ref.db;\n"
+              "        // try_lock to avoid deadlock when finalize is invoked\n"
+              "        // re-entrantly (GC destructor during UDF callback).\n"
+              "        if let Ok(mut db_inner) = db.inner.try_lock() {\n"
+              "            if db_inner.stmt_list == stmt {\n"
+              "                db_inner.stmt_list = stmt_ref.next;\n"
+              "            } else {\n"
+              "                let mut current = db_inner.stmt_list;\n"
+              "                while !current.is_null() {\n"
+              "                    let current_ref = &mut *current;\n"
+              "                    if current_ref.next == stmt {\n"
+              "                        current_ref.next = stmt_ref.next;\n"
+              "                        break;\n"
+              "                    }\n"
+              "                    current = current_ref.next;\n"
+              "                }\n"
+              "            }\n"
+              "        }\n"
+              "    }\n"
+          )
+          assert old in s, 'sqlite3_finalize stmt_list block not found'
+          s = s.replace(old, new, 1)
+
+          # stmt_run_to_completion (called at the top of sqlite3_finalize)
+          # invokes sqlite3_step, which also locks db.inner. Under the same
+          # re-entrant deadlock, this blocks before we even reach the patch
+          # above. Make the drain loop bail out if stepping can't acquire
+          # the mutex.
+          old_src = (
+              "unsafe fn stmt_run_to_completion(stmt: *mut sqlite3_stmt) -> ffi::c_int {\n"
+              "    let stmt_ref = &mut *stmt;\n"
+              "    while stmt_ref.stmt.execution_state().is_running() {\n"
+              "        let result = sqlite3_step(stmt);\n"
+              "        if result != SQLITE_DONE && result != SQLITE_ROW {\n"
+              "            return result;\n"
+              "        }\n"
+              "    }\n"
+              "    SQLITE_OK\n"
+              "}\n"
+          )
+          new_src = (
+              "unsafe fn stmt_run_to_completion(stmt: *mut sqlite3_stmt) -> ffi::c_int {\n"
+              "    let stmt_ref = &mut *stmt;\n"
+              "    // Skip drain if we can't acquire the db mutex: we're\n"
+              "    // re-entering from a UDF callback's GC destructor, and\n"
+              "    // sqlite3_step would block forever. The stmt will be\n"
+              "    // freed anyway by the caller.\n"
+              "    if !stmt_ref.db.is_null() {\n"
+              "        let db = &*stmt_ref.db;\n"
+              "        if db.inner.try_lock().is_err() {\n"
+              "            return SQLITE_OK;\n"
+              "        }\n"
+              "    }\n"
+              "    while stmt_ref.stmt.execution_state().is_running() {\n"
+              "        let result = sqlite3_step(stmt);\n"
+              "        if result != SQLITE_DONE && result != SQLITE_ROW {\n"
+              "            return result;\n"
+              "        }\n"
+              "    }\n"
+              "    SQLITE_OK\n"
+              "}\n"
+          )
+          assert old_src in s, 'stmt_run_to_completion block not found'
+          s = s.replace(old_src, new_src, 1)
+
+          open(p, 'w').write(s)
+          print('patched sqlite3_finalize + stmt_run_to_completion for GC re-entry')
+          PY_FIX_FINALIZE
+
           # Turso's custom-function registry is capped at 32 pre-generated
           # bridge trampolines; the driver registers 44 UDFs, so the last 12
           # silently fail. Bump to 64 by adding 32 more func_bridge!/FUNC_BRIDGES
@@ -964,15 +1068,10 @@ jobs:
         # any <error> or <failure>, the step fails.
         run: |
           set +e
-          # Currently skipped:
-          #   - WP_MySQL_Server_Suite_*: tokenise/parse a 5.7 MB fixture in a
-          #     single loop, runs well over 10 min under LD_PRELOAD (not a
-          #     Turso issue; pure PHP work).
-          #   - WP_SQLite_Driver_Translation_Tests: all 56 tests complete,
-          #     but leave Turso in a state where the next test hangs
-          #     (testReconstructTable 10-min timeout). Re-skip until the
-          #     state-leak is understood.
-          skip_regex='^(?!WP_MySQL_Server_Suite_|WP_SQLite_Driver_Translation_Tests).+'
+          # Only the two CSV-driven server-suite tests remain skipped —
+          # they tokenise/parse a 5.7 MB fixture in a single loop and run
+          # well over 10 min under LD_PRELOAD (not a Turso issue).
+          skip_regex='^(?!WP_MySQL_Server_Suite_).+'
           timeout --kill-after=10 600 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --debug \
