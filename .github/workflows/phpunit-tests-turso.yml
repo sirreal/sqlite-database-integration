@@ -404,6 +404,35 @@ jobs:
           print('patched CollationSeq to alias MySQL collations')
           PY_COLLATION
 
+          # Real SQLite permits DELETE on sqlite_sequence (it's the documented
+          # way to reset the AUTOINCREMENT counter after a TRUNCATE). Turso's
+          # delete translator rejects any table whose name starts with
+          # "sqlite_"; exempt sqlite_sequence specifically.
+          python3 - <<'PY_DELETE_SEQ'
+          p = 'core/translate/delete.rs'
+          s = open(p).read()
+          old = (
+              "    if !connection.is_nested_stmt()\n"
+              "        && !connection.is_mvcc_bootstrap_connection()\n"
+              "        && crate::schema::is_system_table(tbl_name)\n"
+              "    {\n"
+              "        crate::bail_parse_error!(\"table {tbl_name} may not be modified\");\n"
+              "    }\n"
+          )
+          new = (
+              "    if !connection.is_nested_stmt()\n"
+              "        && !connection.is_mvcc_bootstrap_connection()\n"
+              "        && crate::schema::is_system_table(tbl_name)\n"
+              "        && !tbl_name.eq_ignore_ascii_case(\"sqlite_sequence\")\n"
+              "    {\n"
+              "        crate::bail_parse_error!(\"table {tbl_name} may not be modified\");\n"
+              "    }\n"
+          )
+          assert old in s, 'delete.rs system-table guard not found'
+          open(p, 'w').write(s.replace(old, new, 1))
+          print('patched delete.rs to allow DELETE FROM sqlite_sequence')
+          PY_DELETE_SEQ
+
           echo '--- Patched stub! macro ---'
           sed -n '/macro_rules! stub/,/^}$/p' sqlite3/src/lib.rs
 
