@@ -105,6 +105,29 @@ jobs:
           print(f'patched {n} sqlite3_column_* functions')
           PY
 
+          # SQLite looks up function names case-insensitively, but Turso's
+          # extension registry stores names as-is and connection.rs looks
+          # them up with HashMap::get directly. The driver's translator emits
+          # e.g. THROW(...) uppercase, so 32 tests fail with
+          # "no such function: THROW" even though we registered "throw".
+          # Normalise to lowercase at both register and lookup sites.
+          python3 - <<'PY_FN_CASE'
+          p = 'core/connection.rs'
+          s = open(p).read()
+          old = 'self.functions.get(name).cloned()'
+          new = 'self.functions.get(&name.to_lowercase()).cloned()'
+          assert old in s, 'resolve_function lookup not found'
+          open(p, 'w').write(s.replace(old, new, 1))
+
+          p = 'core/ext/mod.rs'
+          s = open(p).read()
+          old = '(*ext_ctx.syms).functions.insert(\n            name_str.clone(),'
+          new = '(*ext_ctx.syms).functions.insert(\n            name_str.to_lowercase(),'
+          assert old in s, 'register_scalar_function insert not found'
+          open(p, 'w').write(s.replace(old, new, 1))
+          print('patched function-name case (register + resolve)')
+          PY_FN_CASE
+
           echo '--- Patched stub! macro ---'
           sed -n '/macro_rules! stub/,/^}$/p' sqlite3/src/lib.rs
 
