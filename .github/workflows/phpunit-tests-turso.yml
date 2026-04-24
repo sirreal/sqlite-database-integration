@@ -553,6 +553,15 @@ jobs:
               "\t\t\t// Normalise Turso-specific decoration to SQLite format.\n"
               "\t\t\t$msg = str_replace( 'Runtime error: ', '', $msg );\n"
               "\t\t\t$msg = preg_replace( '/ \\(19\\)$/', '', $msg );\n"
+              "\t\t\t// UNIQUE constraint failed: t.(a, b) -> t.a, t.b\n"
+              "\t\t\t$msg = preg_replace_callback(\n"
+              "\t\t\t\t'/(\\w+)\\.\\(([^)]+)\\)/',\n"
+              "\t\t\t\tfunction ( $m ) {\n"
+              "\t\t\t\t\t$cols = array_map( 'trim', explode( ',', $m[2] ) );\n"
+              "\t\t\t\t\treturn implode( ', ', array_map( fn( $c ) => $m[1] . '.' . $c, $cols ) );\n"
+              "\t\t\t\t},\n"
+              "\t\t\t\t$msg\n"
+              "\t\t\t);\n"
               "\t\t\tthrow $this->new_driver_exception( $msg, $e->getCode(), $e );"
           )
           assert old in src, 'rethrow block not found'
