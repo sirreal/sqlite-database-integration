@@ -818,6 +818,20 @@ jobs:
               -ex "bt" \
               --args "$(command -v php)" || true
 
+      - name: Run PHPUnit testFromBase64Function under gdb
+        continue-on-error: true
+        env:
+          PRELOAD: ${{ steps.preload.outputs.value }}
+        working-directory: packages/mysql-on-sqlite
+        run: |
+          timeout --kill-after=10 120 gdb -batch \
+              -ex "set confirm off" \
+              -ex "set pagination off" \
+              -ex "set environment LD_PRELOAD=$PRELOAD" \
+              -ex "run ./vendor/bin/phpunit -c ./phpunit.xml.dist --filter 'WP_SQLite_Driver_Tests::testFromBase64Function$'" \
+              -ex "bt 40" \
+              --args "$(command -v php)" || true
+
       - name: Run PHPUnit tests against Turso DB
         env:
           LD_PRELOAD: ${{ steps.preload.outputs.value }}
@@ -837,8 +851,9 @@ jobs:
           #     a single PHP loop; hangs past our 10-minute step budget on
           #     this runner. Pure PHP (doesn't touch Turso), skipping until
           #     it can run in its own process.
-          # Debug: run only testFromBase64Function to see if it hangs alone.
-          skip_regex='WP_SQLite_Driver_Tests::testFromBase64Function'
+          # Still skipping base64 tests for the main run until the hang is
+          # understood (see preceding gdb step).
+          skip_regex='^(?!WP_MySQL_Server_Suite_|WP_SQLite_Driver_Tests::testFromBase64Function|WP_SQLite_Driver_Tests::testToBase64Function).+'
           timeout --kill-after=10 600 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --debug \
