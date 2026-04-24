@@ -105,6 +105,42 @@ jobs:
           print(f'patched {n} sqlite3_column_* functions')
           PY
 
+          # Turso's create_function_v2 invokes the previous FuncSlot's destroy
+          # callback when re-registering a UDF with the same name. In practice
+          # (PHPUnit) this means:
+          #   - setUp #1 opens PDO A, registers 44 UDFs, each with a destroy
+          #     callback + p_app pointing to A.
+          #   - tearDown closes PDO A — Turso's sqlite3_close doesn't clear
+          #     those FuncSlots.
+          #   - setUp #2 opens PDO B, re-registers the same 44 names. Turso
+          #     invokes the OLD destroy callback with the now-dangling A p_app,
+          #     which trips pdo_sqlite and hangs the process.
+          # Comment the destroy invocation out; the callbacks still fire at
+          # real PDO-destruction time from the PHP side.
+          python3 - <<'PY_FIX_DESTROY'
+          p = 'sqlite3/src/lib.rs'
+          s = open(p).read()
+          old = (
+              "        // Reuse existing slot — invoke old destroy callback on old user data.\n"
+              "        if let Some(old) = slots[id].take() {\n"
+              "            if old.destroy != 0 {\n"
+              "                let old_destroy: unsafe extern \"C\" fn(*mut ffi::c_void) =\n"
+              "                    std::mem::transmute(old.destroy);\n"
+              "                old_destroy(old.p_app as *mut ffi::c_void);\n"
+              "            }\n"
+              "        }\n"
+          )
+          new = (
+              "        // Don't invoke the old destroy callback here — in PDO\n"
+              "        // usage the previous slot's p_app often belongs to a db\n"
+              "        // that has already been closed, so the callback UAFs.\n"
+              "        let _ = slots[id].take();\n"
+          )
+          assert old in s, 'slot destroy block not found'
+          open(p, 'w').write(s.replace(old, new, 1))
+          print('patched slot-reuse destroy invocation')
+          PY_FIX_DESTROY
+
           # Turso's custom-function registry is capped at 32 pre-generated
           # bridge trampolines; the driver registers 44 UDFs, so the last 12
           # silently fail. Bump to 64 by adding 32 more func_bridge!/FUNC_BRIDGES
@@ -801,9 +837,10 @@ jobs:
           #     a single PHP loop; hangs past our 10-minute step budget on
           #     this runner. Pure PHP (doesn't touch Turso), skipping until
           #     it can run in its own process.
-          # Temporarily unskipping everything to see what still hangs with the
-          # current set of patches.
-          skip_regex='.+'
+          # Skipping the two CSV-driven MySQL server-suite tests — they
+          # tokenize/parse a 5.7 MB fixture in a single loop and run for well
+          # over 10 min under LD_PRELOAD (pure-PHP, not a Turso issue).
+          skip_regex='^(?!WP_MySQL_Server_Suite_).+'
           timeout --kill-after=10 600 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --debug \
