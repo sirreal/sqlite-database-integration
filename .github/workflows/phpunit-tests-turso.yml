@@ -1016,22 +1016,6 @@ jobs:
           open(path, 'w').write(src)
           print('patched hex-literal alias force under Turso')
 
-          # 9. Turso doesn't propagate VALUES row-column aliases (column1,
-          #    column2, ...) through `INSERT ... SELECT ... FROM (VALUES (...))`
-          #    subqueries, even though top-level `SELECT column1 FROM (VALUES
-          #    (...))` works in its own test suite. The driver already has a
-          #    legacy fallback for SQLite < 3.33 that prepends an explicit
-          #    `SELECT NULL AS column1, ... WHERE FALSE UNION ALL ...` so the
-          #    UNION output carries the aliases. Force-enable that fallback
-          #    unconditionally so it applies under Turso too.
-          path = 'src/sqlite/class-wp-pdo-mysql-on-sqlite.php'
-          src = open(path).read()
-          old = "\t\t\t$is_values_naming_supported = version_compare( $this->get_sqlite_version(), '3.33.0', '>=' );"
-          new = "\t\t\t$is_values_naming_supported = false; // Turso: always use UNION ALL header fallback."
-          assert old in src, 'is_values_naming_supported assignment not found'
-          open(path, 'w').write(src.replace(old, new, 1))
-          print('patched VALUES-aliasing fallback to always-on under Turso')
-
           # 10. CHECK TABLE on a missing table on real SQLite raises from
           #     `PRAGMA integrity_check(<tbl>)`; on Turso the PRAGMA is a
           #     no-op for unknown tables, so testCheckTable sees status=OK
