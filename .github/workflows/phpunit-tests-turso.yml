@@ -837,10 +837,8 @@ jobs:
           #     a single PHP loop; hangs past our 10-minute step budget on
           #     this runner. Pure PHP (doesn't touch Turso), skipping until
           #     it can run in its own process.
-          # Skipping the two CSV-driven MySQL server-suite tests — they
-          # tokenize/parse a 5.7 MB fixture in a single loop and run for well
-          # over 10 min under LD_PRELOAD (pure-PHP, not a Turso issue).
-          skip_regex='^(?!WP_MySQL_Server_Suite_).+'
+          # Debug: run only testFromBase64Function to see if it hangs alone.
+          skip_regex='WP_SQLite_Driver_Tests::testFromBase64Function'
           timeout --kill-after=10 600 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --debug \
