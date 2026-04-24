@@ -31,6 +31,25 @@ jobs:
           repository: dolthub/doltlite
           path: doltlite-src
 
+      - name: Patch Doltlite for mysql-on-sqlite compatibility
+        # Narrow, verifiable source-level patches applied before build:
+        #
+        # 1) src/build.c — neutralize the auto-conversion of composite/TEXT-PK
+        #    tables to WITHOUT ROWID, so the driver's `ORDER BY ROWID`
+        #    tie-breaks in info-schema reads keep working.
+        run: |
+          BUILD=doltlite-src/src/build.c
+
+          # --- Patch 1: disable WITHOUT ROWID auto-conversion ---
+          N=$(grep -cF '    tabOpts |= TF_WithoutRowid;' "$BUILD")
+          if [ "$N" != "1" ]; then
+            echo "::error::build.c patch: expected exactly 1 match, found $N"; exit 1
+          fi
+          sed -i 's@^    tabOpts |= TF_WithoutRowid;$@    /* patched off in CI: do not auto-convert composite-PK tables */ (void)0;@' "$BUILD"
+
+          echo "--- Patched lines ---"
+          grep -n 'patched off in CI' "$BUILD"
+
       - name: Build Doltlite shared library
         run: |
           mkdir -p build
@@ -74,7 +93,7 @@ jobs:
           echo "ldd pdo_sqlite:"
           ldd "$(php -r 'echo ini_get("extension_dir");')/pdo_sqlite.so"
 
-      - name: Verify Doltlite is active
+      - name: Verify Doltlite is active and patches took effect
         run: |
           VERSION=$(php -r 'echo (new PDO("sqlite::memory:"))->query("SELECT SQLITE_VERSION()")->fetch()[0];')
           ENGINE=$(php -r 'echo (new PDO("sqlite::memory:"))->query("SELECT doltlite_engine()")->fetch()[0];')
@@ -82,6 +101,19 @@ jobs:
           echo "doltlite_engine() = ${ENGINE}"
           if [ "${ENGINE}" != "prolly" ]; then
             echo "::error::Doltlite is not active (expected doltlite_engine() = 'prolly', got '${ENGINE}')"
+            exit 1
+          fi
+          # 1) build.c patch: composite-PK tables keep rowid accessible
+          # instead of auto-converting to WITHOUT ROWID.
+          ROWID=$(php -r '
+            $db = new PDO("sqlite::memory:");
+            $db->exec("CREATE TABLE t (a INT, b INT, PRIMARY KEY(a, b))");
+            $db->exec("INSERT INTO t VALUES (1, 2)");
+            echo $db->query("SELECT rowid FROM t")->fetch()[0];
+          ' 2>&1)
+          echo "composite-PK rowid = ${ROWID}"
+          if ! [[ "${ROWID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::rowid-preservation patch did not take effect: ${ROWID}"
             exit 1
           fi
 
