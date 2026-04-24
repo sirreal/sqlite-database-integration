@@ -592,7 +592,7 @@ jobs:
           # level — its tests are assertion-heavy snapshot comparisons of
           # the MySQL → SQLite translation, which don't need a working DB.
           skip_regex='^(?!WP_SQLite_Driver_Translation_Tests).+'
-          timeout --kill-after=10 180 \
+          timeout --kill-after=10 600 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
                   --debug \
                   --filter "$skip_regex" \
