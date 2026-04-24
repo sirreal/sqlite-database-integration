@@ -433,48 +433,6 @@ jobs:
           print('patched delete.rs to allow DELETE FROM sqlite_sequence')
           PY_DELETE_SEQ
 
-          # PRAGMA table_info serializes default-expr AST back to a string
-          # and keeps any outer parens. Real SQLite strips one level of
-          # balanced outer parens; match that.
-          python3 - <<'PY_PRAGMA_DEFAULT'
-          p = 'core/translate/pragma.rs'
-          s = open(p).read()
-          old = (
-              "            Some(expr) => {\n"
-              "                program.emit_string8(expr.to_string(), base_reg + 4);\n"
-              "            }\n"
-          )
-          new = (
-              "            Some(expr) => {\n"
-              "                let raw = expr.to_string();\n"
-              "                let bytes = raw.as_bytes();\n"
-              "                let len = bytes.len();\n"
-              "                let stripped: String = if len >= 2 && bytes[0] == b'(' && bytes[len - 1] == b')' {\n"
-              "                    let mut depth: i32 = 0;\n"
-              "                    let mut ok = true;\n"
-              "                    for i in 1..len - 1 {\n"
-              "                        if bytes[i] == b'(' { depth += 1; }\n"
-              "                        else if bytes[i] == b')' {\n"
-              "                            if depth == 0 { ok = false; break; }\n"
-              "                            depth -= 1;\n"
-              "                        }\n"
-              "                    }\n"
-              "                    if ok && depth == 0 {\n"
-              "                        raw[1..len - 1].trim().to_string()\n"
-              "                    } else {\n"
-              "                        raw.clone()\n"
-              "                    }\n"
-              "                } else {\n"
-              "                    raw.clone()\n"
-              "                };\n"
-              "                program.emit_string8(stripped, base_reg + 4);\n"
-              "            }\n"
-          )
-          assert old in s, 'PRAGMA table_info default-emit block not found'
-          open(p, 'w').write(s.replace(old, new, 1))
-          print('patched PRAGMA table_info to strip outer parens from default')
-          PY_PRAGMA_DEFAULT
-
           echo '--- Patched stub! macro ---'
           sed -n '/macro_rules! stub/,/^}$/p' sqlite3/src/lib.rs
 
