@@ -111,7 +111,7 @@ jobs:
           # custom UDFs return text/blob values. Fix both frees to use the
           # stored length and rebuild the correct slice box.
           python3 - <<'PY_FIX_TYPES'
-          p = '../extensions/core/src/types.rs'
+          p = 'extensions/core/src/types.rs'
           s = open(p).read()
 
           # TextValue::free
