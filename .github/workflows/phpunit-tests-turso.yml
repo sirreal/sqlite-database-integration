@@ -433,6 +433,41 @@ jobs:
           print('patched delete.rs to allow DELETE FROM sqlite_sequence')
           PY_DELETE_SEQ
 
+          # CREATE TRIGGER: Turso reconstructs the stored sqlite_master.sql by
+          # serializing the AST (trigger::create_trigger_to_sql), which loses
+          # user-provided whitespace/formatting. Real SQLite preserves the
+          # original text. testColumnWithOnUpdate asserts on the stored text;
+          # use the raw input SQL that was already threaded into translate_inner.
+          python3 - <<'PY_TRIGGER_SQL'
+          p = 'core/translate/mod.rs'
+          s = open(p).read()
+          old = (
+              "            // Reconstruct SQL for storage\n"
+              "            let sql = trigger::create_trigger_to_sql(\n"
+              "                temporary,\n"
+              "                if_not_exists,\n"
+              "                &trigger_name,\n"
+              "                time,\n"
+              "                &event,\n"
+              "                &tbl_name,\n"
+              "                for_each_row,\n"
+              "                when_clause.as_deref(),\n"
+              "                &commands,\n"
+              "            );\n"
+          )
+          new = (
+              "            // Preserve original SQL text (matches real SQLite);\n"
+              "            // avoid AST reconstruction which loses whitespace.\n"
+              "            let _ = (\n"
+              "                &event, for_each_row, when_clause.as_deref(), &commands,\n"
+              "            );\n"
+              "            let sql = input.to_string();\n"
+          )
+          assert old in s, 'CreateTrigger reconstruction block not found'
+          open(p, 'w').write(s.replace(old, new, 1))
+          print('patched CreateTrigger to preserve original SQL text')
+          PY_TRIGGER_SQL
+
           echo '--- Patched stub! macro ---'
           sed -n '/macro_rules! stub/,/^}$/p' sqlite3/src/lib.rs
 
