@@ -927,6 +927,47 @@ jobs:
                   --filter '^(WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable)'
           echo "Translation+reconstruct exit: $?"
 
+      - name: Probe Driver_Tests + Translation + testReconstructTable
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.preload.outputs.value }}
+        working-directory: packages/mysql-on-sqlite
+        # Bisecting: is the pollution coming from WP_SQLite_Driver_Tests?
+        # Prints first-failure marker if testReconstructTable doesn't end.
+        run: |
+          set +e
+          timeout --kill-after=10 600 \
+              php ./vendor/bin/phpunit -c ./phpunit.xml.dist --debug \
+                  --filter '^(WP_SQLite_Driver_Tests|WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable$)' \
+              2>&1 | grep -E "(testReconstructTable|^Time:|^OK|FAILURES|^Tests:|^ERRORS|test.*started|test.*ended)" | tail -40
+          echo "Driver+Translation+reconstruct exit: $?"
+
+      - name: Probe Metadata_Tests + Translation + testReconstructTable
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.preload.outputs.value }}
+        working-directory: packages/mysql-on-sqlite
+        # Bisecting: is the pollution coming from Metadata_Tests?
+        run: |
+          set +e
+          timeout --kill-after=10 300 \
+              php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
+                  --filter '^(WP_SQLite_Driver_Metadata_Tests|WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable$)'
+          echo "Metadata+Translation+reconstruct exit: $?"
+
+      - name: Probe PDO_API + Translation + testReconstructTable
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.preload.outputs.value }}
+        working-directory: packages/mysql-on-sqlite
+        # Bisecting: is the pollution coming from PDO_API_Tests?
+        run: |
+          set +e
+          timeout --kill-after=10 300 \
+              php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
+                  --filter '^(WP_PDO_MySQL_On_SQLite_PDO_API_Tests|WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable$)'
+          echo "PDO_API+Translation+reconstruct exit: $?"
+
       - name: Run PHPUnit tests against Turso DB
         env:
           LD_PRELOAD: ${{ steps.preload.outputs.value }}
