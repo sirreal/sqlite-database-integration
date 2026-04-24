@@ -1057,6 +1057,109 @@ jobs:
           open(path, 'w').write(src.replace(old, new, 1))
           print('patched CHECK TABLE missing-table check')
 
+          # 12. Turso doesn't propagate VALUES row-column aliases (column1,
+          #     column2, ...) through `INSERT ... SELECT ... FROM (VALUES ...)`
+          #     subqueries — outer reference to `column1` fails with
+          #     "no such column". Replace the VALUES subquery with a
+          #     UNION ALL of SELECTs carrying explicit `expr AS columnN`
+          #     aliases (single-row case collapses to a single SELECT).
+          path = 'src/sqlite/class-wp-pdo-mysql-on-sqlite.php'
+          src = open(path).read()
+          old = (
+              "\t\tif ( 'insertFromConstructor' === $node->rule_name ) {\n"
+              "\t\t\t// VALUES (...)\n"
+              "\t\t\t$insert_values = $node->get_first_child_node( 'insertValues' );\n"
+              "\t\t\t$from          = $this->translate( $insert_values );\n"
+              "\n"
+              "\t\t\t/**\n"
+              "\t\t\t * The automatic \"columnN\" naming for VALUES lists is supported only\n"
+              "\t\t\t * from SQLite 3.33.0. For older versions, we need to emulate it by\n"
+              "\t\t\t * prepending a dummy VALUES list header via the UNION ALL operator:\n"
+              "\t\t\t *\n"
+              "\t\t\t * SELECT\n"
+              "\t\t\t *   NULL AS `column1`, NULL AS `column2`, ... WHERE FALSE\n"
+              "\t\t\t *   UNION ALL\n"
+              "\t\t\t *   VALUES (value1, value2, ...)\n"
+              "\t\t\t */\n"
+              "\t\t\t$is_values_naming_supported = version_compare( $this->get_sqlite_version(), '3.33.0', '>=' );\n"
+              "\t\t\tif ( ! $is_values_naming_supported ) {\n"
+              "\t\t\t\t$values_list = $insert_values->get_first_child_node( 'valueList' );\n"
+              "\t\t\t\t$values      = $values_list->get_first_child_node( 'values' );\n"
+              "\t\t\t\t$value_count = (\n"
+              "\t\t\t\t\tcount( $values->get_child_nodes( 'expr' ) )\n"
+              "\t\t\t\t\t+ count( $values->get_child_nodes( WP_MySQL_Lexer::DEFAULT_SYMBOL ) )\n"
+              "\t\t\t\t);\n"
+              "\n"
+              "\t\t\t\t$columns_list = '';\n"
+              "\t\t\t\tfor ( $i = 1; $i <= $value_count; $i++ ) {\n"
+              "\t\t\t\t\t$columns_list .= $i > 1 ? ', ' : '';\n"
+              "\t\t\t\t\t$columns_list .= 'NULL AS ' . $this->quote_sqlite_identifier( 'column' . $i );\n"
+              "\t\t\t\t}\n"
+              "\t\t\t\t$from = 'SELECT ' . $columns_list . ' WHERE FALSE UNION ALL ' . $from;\n"
+              "\t\t\t}\n"
+              "\t\t}"
+          )
+          new = (
+              "\t\tif ( 'insertFromConstructor' === $node->rule_name ) {\n"
+              "\t\t\t// Build a UNION ALL of SELECT rows with explicit `expr AS columnN`\n"
+              "\t\t\t// aliases. Turso doesn't propagate implicit VALUES column names\n"
+              "\t\t\t// through INSERT...SELECT subqueries.\n"
+              "\t\t\t$insert_values = $node->get_first_child_node( 'insertValues' );\n"
+              "\t\t\t$value_list    = $insert_values->get_first_child_node( 'valueList' );\n"
+              "\t\t\t$values_nodes  = $value_list->get_child_nodes( 'values' );\n"
+              "\t\t\t$select_rows   = array();\n"
+              "\t\t\tforeach ( $values_nodes as $values_node ) {\n"
+              "\t\t\t\t$position  = 0;\n"
+              "\t\t\t\t$row_parts = array();\n"
+              "\t\t\t\tforeach ( $values_node->get_children() as $child ) {\n"
+              "\t\t\t\t\tif ( $child instanceof WP_Parser_Node && 'expr' === $child->rule_name ) {\n"
+              "\t\t\t\t\t\t$expr_sql = $this->translate( $child );\n"
+              "\t\t\t\t\t\t$row_parts[] = $expr_sql . ' AS ' . $this->quote_sqlite_identifier( 'column' . ( $position + 1 ) );\n"
+              "\t\t\t\t\t\t$position++;\n"
+              "\t\t\t\t\t} elseif ( $child instanceof WP_Parser_Token && WP_MySQL_Lexer::DEFAULT_SYMBOL === $child->id ) {\n"
+              "\t\t\t\t\t\t$row_parts[] = 'NULL AS ' . $this->quote_sqlite_identifier( 'column' . ( $position + 1 ) );\n"
+              "\t\t\t\t\t\t$position++;\n"
+              "\t\t\t\t\t}\n"
+              "\t\t\t\t}\n"
+              "\t\t\t\t$select_rows[] = 'SELECT ' . implode( ', ', $row_parts );\n"
+              "\t\t\t}\n"
+              "\t\t\t$from = implode( ' UNION ALL ', $select_rows );\n"
+              "\t\t}"
+          )
+          assert old in src, 'insertFromConstructor VALUES block not found'
+          open(path, 'w').write(src.replace(old, new, 1))
+          print('patched insertFromConstructor to emit SELECT-with-aliases form')
+
+          # 13. Update Translation_Tests expectations to match the new
+          #     SELECT-AS-columnN form emitted by insertFromConstructor.
+          path = 'tests/WP_SQLite_Driver_Translation_Tests.php'
+          src = open(path).read()
+          # Match `FROM (VALUES ( v1 [, v2 ...] ) [, ( ... ) ...])`
+          # where values are simple literals (no nested parens or strings
+          # containing parens — good enough for all hits in this file).
+          values_pattern = re.compile(
+              r"\(VALUES "
+              r"\( ([^()]+) \)"
+              r"((?: , \( [^()]+ \))*)"
+              r"\)"
+          )
+          def rewrite_values(m):
+              first_row = m.group(1).strip()
+              extra_rows_text = m.group(2)
+              rows = [first_row]
+              for row_match in re.finditer(r"\( ([^()]+) \)", extra_rows_text):
+                  rows.append(row_match.group(1).strip())
+              selects = []
+              for row in rows:
+                  values = [v.strip() for v in row.split(',')]
+                  parts = [f"{v} AS `column{i+1}`" for i, v in enumerate(values)]
+                  selects.append("SELECT " + ", ".join(parts))
+              return "(" + " UNION ALL ".join(selects) + ")"
+          new_src, n = values_pattern.subn(rewrite_values, src)
+          assert n >= 10, f'expected 10+ VALUES expectations, matched {n}'
+          open(path, 'w').write(new_src)
+          print(f'patched {n} Translation_Tests VALUES expectations to SELECT form')
+
           # 11. 6 Translation_Tests assert on the exact SQL emitted by
           #     sync_column_key_info. Our EXISTS rewrite (needed because
           #     Turso doesn't implement SQLite's "bare column alongside
