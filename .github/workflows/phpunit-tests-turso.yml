@@ -485,13 +485,18 @@ jobs:
               "\t\t);"
           )
           assert old in src, 'sync_column_key_info UPDATE not found'
+          # Wrap each subquery in IFNULL(..., c.<col>) because Turso's
+          # aggregate-without-GROUP-BY returns zero rows when the WHERE
+          # matches nothing (SQL standard requires one row with NULL
+          # aggregates). Zero rows from a scalar subquery means NULL, which
+          # violates the NOT NULL constraint on is_nullable.
           new = "\n".join([
               "\t\t$columns_table    = $this->connection->quote_identifier( $columns_table_name );",
               "\t\t$statistics_table = $this->connection->quote_identifier( $statistics_table_name );",
               "\t\t$this->connection->query(",
               "\t\t\t\"",
               "\t\t\t\tUPDATE $columns_table AS c",
-              "\t\t\t\tSET column_key = (",
+              "\t\t\t\tSET column_key = IFNULL((",
               "\t\t\t\t\tSELECT",
               "\t\t\t\t\t\tCASE",
               "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'PRI'",
@@ -503,8 +508,8 @@ jobs:
               "\t\t\t\t\tWHERE s.table_schema = c.table_schema",
               "\t\t\t\t\tAND s.table_name = c.table_name",
               "\t\t\t\t\tAND s.column_name = c.column_name",
-              "\t\t\t\t),",
-              "\t\t\t\tis_nullable = (",
+              "\t\t\t\t), c.column_key),",
+              "\t\t\t\tis_nullable = IFNULL((",
               "\t\t\t\t\tSELECT",
               "\t\t\t\t\t\tCASE",
               "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'NO'",
@@ -514,7 +519,7 @@ jobs:
               "\t\t\t\t\tWHERE s.table_schema = c.table_schema",
               "\t\t\t\t\tAND s.table_name = c.table_name",
               "\t\t\t\t\tAND s.column_name = c.column_name",
-              "\t\t\t\t)",
+              "\t\t\t\t), c.is_nullable)",
               "\t\t\t\tWHERE c.table_schema = ?",
               "\t\t\t\tAND c.table_name = ?",
               "\t\t\t\",",
