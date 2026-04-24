@@ -37,8 +37,22 @@ jobs:
         # 1) src/build.c — neutralize the auto-conversion of composite/TEXT-PK
         #    tables to WITHOUT ROWID, so the driver's `ORDER BY ROWID`
         #    tie-breaks in info-schema reads keep working.
+        #
+        # 2) src/prolly_btree.c — fix a write-visibility bug in
+        #    prollyBtCursorIndexMoveto. When a non-empty mutmap exists,
+        #    the function calls findMatchingMutMapEntry which internally
+        #    calls sqlite3VdbeRecordCompare with `pIdxKey->eqSeen = 0`
+        #    on every comparison, clobbering the eqSeen flag that the
+        #    tree scan loop above it set. OP_SeekGE with BTREE_SEEK_EQ
+        #    relies on eqSeen to detect prefix matches, so the second
+        #    same-table DELETE inside a SAVEPOINT lands on an exact
+        #    match in the tree but SeekGE reads eqSeen=0 and bails to
+        #    seek_not_found, skipping the actual delete. The patch
+        #    saves eqSeen before findMatchingMutMapEntry and restores
+        #    it when no mutmap entry overrides the tree result.
         run: |
           BUILD=doltlite-src/src/build.c
+          MOVETO=doltlite-src/src/prolly_btree.c
 
           # --- Patch 1: disable WITHOUT ROWID auto-conversion ---
           N=$(grep -cF '    tabOpts |= TF_WithoutRowid;' "$BUILD")
@@ -47,8 +61,12 @@ jobs:
           fi
           sed -i 's@^    tabOpts |= TF_WithoutRowid;$@    /* patched off in CI: do not auto-convert composite-PK tables */ (void)0;@' "$BUILD"
 
+          # --- Patch 2: preserve pIdxKey->eqSeen across findMatchingMutMapEntry ---
+          patch -d doltlite-src -p1 --no-backup-if-mismatch \
+            < .github/doltlite-patches/eqSeen-preservation.patch
+
           echo "--- Patched lines ---"
-          grep -n 'patched off in CI' "$BUILD"
+          grep -n 'patched off in CI\|savedEqSeen' "$BUILD" "$MOVETO"
 
       - name: Build Doltlite shared library
         run: |
@@ -114,6 +132,27 @@ jobs:
           echo "composite-PK rowid = ${ROWID}"
           if ! [[ "${ROWID}" =~ ^[0-9]+$ ]]; then
             echo "::error::rowid-preservation patch did not take effect: ${ROWID}"
+            exit 1
+          fi
+          # 2) prolly_btree.c patch: two sequential DELETEs inside a
+          # SAVEPOINT on a composite NOCASE PK no longer silently lose
+          # the second DELETE.
+          REMAINING=$(php -r '
+            $db = new PDO("sqlite::memory:");
+            $db->exec("CREATE TABLE t (ts TEXT NOT NULL COLLATE NOCASE, tn TEXT NOT NULL COLLATE NOCASE, cn TEXT NOT NULL COLLATE NOCASE, PRIMARY KEY (ts, tn, cn))");
+            $db->exec("INSERT INTO t VALUES (\"s\", \"t\", \"id\")");
+            $db->exec("INSERT INTO t VALUES (\"s\", \"t\", \"alpha\")");
+            $db->exec("INSERT INTO t VALUES (\"s\", \"t\", \"beta\")");
+            $db->exec("SAVEPOINT sp");
+            $db->exec("DELETE FROM t WHERE ts = \"s\" AND tn = \"t\" AND cn = \"alpha\"");
+            $db->exec("DELETE FROM t WHERE ts = \"s\" AND tn = \"t\" AND cn = \"beta\"");
+            $db->exec("RELEASE SAVEPOINT sp");
+            $rows = $db->query("SELECT cn FROM t ORDER BY cn")->fetchAll(PDO::FETCH_COLUMN);
+            echo implode(",", $rows);
+          ' 2>&1)
+          echo "post-SAVEPOINT remaining rows = ${REMAINING}"
+          if [ "${REMAINING}" != "id" ]; then
+            echo "::error::eqSeen-preservation patch did not take effect: expected only 'id', got '${REMAINING}'"
             exit 1
           fi
 
