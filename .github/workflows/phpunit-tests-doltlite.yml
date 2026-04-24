@@ -50,6 +50,11 @@ jobs:
         #    seek_not_found, skipping the actual delete. The patch
         #    saves eqSeen before findMatchingMutMapEntry and restores
         #    it when no mutmap entry overrides the tree result.
+        #
+        # 3) src/prolly_btree.c — in mergeScan, when emitting a tree
+        #    entry check the mutmap for a DELETE on that tree key; if
+        #    found, skip and advance. Without this, INSERT+DELETE+UPDATE
+        #    in one transaction trips "database disk image is malformed".
         run: |
           BUILD=doltlite-src/src/build.c
           MOVETO=doltlite-src/src/prolly_btree.c
@@ -65,8 +70,12 @@ jobs:
           patch -d doltlite-src -p1 --no-backup-if-mismatch \
             < .github/doltlite-patches/eqSeen-preservation.patch
 
+          # --- Patch 3: check mutmap for tree-key DELETE in mergeScan ---
+          patch -d doltlite-src -p1 --no-backup-if-mismatch \
+            < .github/doltlite-patches/mergeScan-check-tree-delete.patch
+
           echo "--- Patched lines ---"
-          grep -n 'patched off in CI\|savedEqSeen' "$BUILD" "$MOVETO"
+          grep -n 'patched off in CI\|savedEqSeen\|walked past' "$BUILD" "$MOVETO"
 
       - name: Build Doltlite shared library
         run: |
@@ -153,6 +162,25 @@ jobs:
           echo "post-SAVEPOINT remaining rows = ${REMAINING}"
           if [ "${REMAINING}" != "id" ]; then
             echo "::error::eqSeen-preservation patch did not take effect: expected only 'id', got '${REMAINING}'"
+            exit 1
+          fi
+          # 3) mergeScan patch: UPDATE inside a transaction after an
+          # INSERT + DELETE no longer trips "database disk image is
+          # malformed".
+          VAL=$(php -r '
+            $db = new PDO("sqlite::memory:");
+            $db->exec("CREATE TABLE c (ka TEXT, kb TEXT, kc TEXT, v TEXT, PRIMARY KEY (ka, kb, kc))");
+            $db->exec("INSERT INTO c VALUES (\"db\", \"t\", \"a\", \"\")");
+            $db->exec("BEGIN IMMEDIATE");
+            $db->exec("INSERT INTO c VALUES (\"db\", \"t\", \"b\", \"\")");
+            $db->exec("DELETE FROM c WHERE ka = \"db\" AND kb = \"t\" AND kc = \"a\"");
+            $db->exec("UPDATE c SET v = \"x\" WHERE ka = \"db\" AND kb = \"t\"");
+            $db->exec("COMMIT");
+            echo $db->query("SELECT v FROM c")->fetch()[0];
+          ' 2>&1)
+          echo "post-UPDATE value = ${VAL}"
+          if [ "${VAL}" != "x" ]; then
+            echo "::error::mergeScan patch did not take effect: expected 'x', got '${VAL}'"
             exit 1
           fi
 
