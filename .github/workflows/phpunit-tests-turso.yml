@@ -756,31 +756,9 @@ jobs:
               $log('[d] EXC ' . $e->getMessage());
           }
 
-          // 4) Register 50 and CALL each — not just registration. Turso's
-          //    pre-generated bridges used to be capped at 32 slots; we
-          //    expanded to 64, but need to verify slots 32+ actually dispatch.
-          try {
-              for ($i = 0; $i < 50; $i++) {
-                  $pdo->createFunction("fn_{$i}", function () use ($i) { return "v$i"; });
-              }
-              $log('[e] registered 50 UDFs ok');
-              foreach ([0, 31, 32, 33, 49] as $i) {
-                  $r = $pdo->query("SELECT fn_{$i}() AS v")->fetch(PDO::FETCH_ASSOC);
-                  $log("[e.call {$i}] " . json_encode($r));
-              }
-              // Test case-insensitive lookup: uppercase call on lowercase registration.
-              try {
-                  $r = $pdo->query("SELECT FN_32() AS v")->fetch(PDO::FETCH_ASSOC);
-                  $log('[e.upper 32] ' . json_encode($r));
-              } catch (\Throwable $ex) {
-                  $log('[e.upper 32] EXC: ' . $ex->getMessage());
-              }
-          } catch (\Throwable $e) {
-              $log('[e] EXC: ' . $e->getMessage());
-          }
-
-          // 5) Reproduce the actual testFromBase64Function setup exactly: run
-          //    setUp-style driver construction and then call FROM_BASE64.
+          // 4) Reproduce testFromBase64Function in a clean Turso FUNC_SLOTS
+          //    state (skipping earlier [e] UDF registrations which would
+          //    consume slots 0..49 globally in the same process).
           try {
               require getcwd() . '/tests/bootstrap.php';
               $pdo2 = new PDO\SQLite('sqlite::memory:');
