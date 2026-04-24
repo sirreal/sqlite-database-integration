@@ -368,6 +368,42 @@ jobs:
           print('patched function-name case (register + resolve)')
           PY_FN_CASE
 
+          # Turso's CollationSeq is a closed enum of three built-in collations
+          # (Binary/NoCase/Rtrim). Driver-emitted SQL references MySQL
+          # collations like `utf8mb4_bin` (byte-compare) and `utf8mb4_0900_ai_ci`
+          # (case-insensitive). Map these to the closest built-in at lookup
+          # time before Turso's EnumString rejects the name.
+          python3 - <<'PY_COLLATION'
+          p = 'core/translate/collate.rs'
+          s = open(p).read()
+          old = (
+              "    pub fn new(collation: &str) -> crate::Result<Self> {\n"
+              "        CollationSeq::from_str(collation).map_err(|_| {\n"
+              "            crate::LimboError::ParseError(format!(\"no such collation sequence: {collation}\"))\n"
+              "        })\n"
+              "    }\n"
+          )
+          new = (
+              "    pub fn new(collation: &str) -> crate::Result<Self> {\n"
+              "        // Alias common MySQL collation names to the nearest\n"
+              "        // Turso built-in before strum rejects them.\n"
+              "        let lower = collation.to_ascii_lowercase();\n"
+              "        let alias = match lower.as_str() {\n"
+              "            \"utf8mb4_bin\" | \"utf8_bin\" | \"ascii_bin\" | \"latin1_bin\" => \"Binary\",\n"
+              "            \"utf8mb4_0900_ai_ci\" | \"utf8mb4_general_ci\" | \"utf8_general_ci\"\n"
+              "            | \"latin1_general_ci\" | \"latin1_swedish_ci\" => \"NoCase\",\n"
+              "            _ => collation,\n"
+              "        };\n"
+              "        CollationSeq::from_str(alias).map_err(|_| {\n"
+              "            crate::LimboError::ParseError(format!(\"no such collation sequence: {collation}\"))\n"
+              "        })\n"
+              "    }\n"
+          )
+          assert old in s, 'CollationSeq::new body not found'
+          open(p, 'w').write(s.replace(old, new, 1))
+          print('patched CollationSeq to alias MySQL collations')
+          PY_COLLATION
+
           echo '--- Patched stub! macro ---'
           sed -n '/macro_rules! stub/,/^}$/p' sqlite3/src/lib.rs
 
@@ -855,6 +891,89 @@ jobs:
           src = src.replace(marker, inject + marker, 1)
           open(path, 'w').write(src)
           print('added wp_die polyfill to bootstrap.php')
+
+          # 6. Turso's PRAGMA table_xinfo preserves outer parens on
+          #    `DEFAULT (expr)` columns (real SQLite strips them). That defeats
+          #    the reconstructor's typed checks and falls through to
+          #    quote_mysql_utf8_string_literal, so SHOW CREATE TABLE emits
+          #    DEFAULT '(CURRENT_TIMESTAMP)' / DEFAULT '(1 + 2)' instead of
+          #    DEFAULT CURRENT_TIMESTAMP / DEFAULT '1 + 2'. Strip outer parens
+          #    at the top of generate_column_default so the typed checks see
+          #    the bare expression.
+          path = 'src/sqlite/class-wp-sqlite-information-schema-reconstructor.php'
+          src = open(path).read()
+          old = (
+              "\tprivate function generate_column_default( string $mysql_type, ?string $default_value ): ?string {\n"
+              "\t\tif ( null === $default_value || '' === $default_value ) {\n"
+              "\t\t\treturn null;\n"
+              "\t\t}\n"
+          )
+          new = (
+              "\tprivate function generate_column_default( string $mysql_type, ?string $default_value ): ?string {\n"
+              "\t\tif ( null === $default_value || '' === $default_value ) {\n"
+              "\t\t\treturn null;\n"
+              "\t\t}\n"
+              "\t\tif ( strlen( $default_value ) >= 2 && '(' === $default_value[0] && ')' === substr( $default_value, -1 ) ) {\n"
+              "\t\t\t$default_value = trim( substr( $default_value, 1, -1 ) );\n"
+              "\t\t}\n"
+          )
+          assert old in src, 'generate_column_default prologue not found'
+          src = src.replace(old, new, 1)
+          open(path, 'w').write(src)
+          print('patched reconstructor default-value paren stripping')
+
+          # 7. Turso's PRAGMA table_xinfo returns signed numeric literals with
+          #    a space between sign and digits ("- 1.23", "+ 1.23") — real
+          #    SQLite returns "-1.23". Our is_numeric() check rejects the
+          #    spaced form; collapse the gap so the literal is recognised.
+          src = open(path).read()
+          old = (
+              "\t\t// Numeric literals. E.g.: 123, 1.23, -1.23, 1e3, 1.2e-3\n"
+              "\t\tif ( is_numeric( $no_underscore_default_value ) ) {\n"
+              "\t\t\treturn $no_underscore_default_value;\n"
+              "\t\t}\n"
+          )
+          new = (
+              "\t\t// Numeric literals. E.g.: 123, 1.23, -1.23, 1e3, 1.2e-3\n"
+              "\t\t$normalised_numeric = preg_replace( '/^([+-])\\s+/', '$1', $no_underscore_default_value );\n"
+              "\t\tif ( is_numeric( $normalised_numeric ) ) {\n"
+              "\t\t\treturn $normalised_numeric;\n"
+              "\t\t}\n"
+          )
+          assert old in src, 'generate_column_default numeric block not found'
+          src = src.replace(old, new, 1)
+          open(path, 'w').write(src)
+          print('patched reconstructor signed-numeric spacing')
+
+          # 8. Turso mangles implicit column names for hex literals like
+          #    x'417a' (drops the "x'" prefix). Force an explicit alias for
+          #    hex-literal SELECT items so the column name matches the source
+          #    text, as MySQL/SQLite produce.
+          path = 'src/sqlite/class-wp-pdo-mysql-on-sqlite.php'
+          src = open(path).read()
+          old = (
+              "\t\t$raw_alias = substr( $this->last_mysql_query, $node->get_start(), $node->get_length() );\n"
+              "\t\t$alias     = $this->quote_sqlite_identifier( $raw_alias );\n"
+              "\t\tif ( $alias === $item || $raw_alias === $item ) {\n"
+              "\t\t\t// For the simple case of selecting only columns (\"SELECT id FROM t\"),\n"
+              "\t\t\t// let's avoid unnecessary aliases (\"SELECT `id` AS `id` FROM t\").\n"
+              "\t\t\treturn $item;\n"
+              "\t\t}\n"
+          )
+          new = (
+              "\t\t$raw_alias = substr( $this->last_mysql_query, $node->get_start(), $node->get_length() );\n"
+              "\t\t$alias     = $this->quote_sqlite_identifier( $raw_alias );\n"
+              "\t\t$is_hex_literal = ( 0 === strncasecmp( $item, \"x'\", 2 ) );\n"
+              "\t\tif ( ! $is_hex_literal && ( $alias === $item || $raw_alias === $item ) ) {\n"
+              "\t\t\t// For the simple case of selecting only columns (\"SELECT id FROM t\"),\n"
+              "\t\t\t// let's avoid unnecessary aliases (\"SELECT `id` AS `id` FROM t\").\n"
+              "\t\t\treturn $item;\n"
+              "\t\t}\n"
+          )
+          assert old in src, 'translate_select_item block not found'
+          src = src.replace(old, new, 1)
+          open(path, 'w').write(src)
+          print('patched hex-literal alias force under Turso')
           PY
 
       - name: Capture failing SQL from the first failing driver test
