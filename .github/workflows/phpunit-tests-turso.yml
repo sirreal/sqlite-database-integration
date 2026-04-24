@@ -968,6 +968,43 @@ jobs:
                   --filter '^(WP_PDO_MySQL_On_SQLite_PDO_API_Tests|WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable$)'
           echo "PDO_API+Translation+reconstruct exit: $?"
 
+      - name: Probe full main run with Translation unskipped + gdb watchdog
+        continue-on-error: true
+        env:
+          LD_PRELOAD: ${{ steps.preload.outputs.value }}
+        working-directory: packages/mysql-on-sqlite
+        # Reproduce the 4c4f491 main-run state (Translation_Tests unskipped).
+        # Previous runs hang here at testReconstructTable for 10 min; install a
+        # watchdog that snapshots the PHP process with gdb before killing it.
+        run: |
+          set +e
+          skip_regex='^(?!WP_MySQL_Server_Suite_).+'
+
+          # Watchdog: after 150s, grab a backtrace of the hanging PHP.
+          (
+            sleep 150
+            PHP_PID=$(pgrep -f 'phpunit.*--filter' | head -1)
+            if [ -n "$PHP_PID" ]; then
+              echo "=== watchdog: attaching gdb to php pid $PHP_PID ==="
+              sudo gdb -p "$PHP_PID" -batch \
+                -ex 'set pagination off' \
+                -ex 'info threads' \
+                -ex 'thread apply all bt 40' \
+                2>&1 | head -400
+              echo "=== watchdog: done ==="
+            else
+              echo "=== watchdog: no php pid found ==="
+            fi
+          ) &
+          WATCHDOG=$!
+
+          timeout --kill-after=10 180 \
+              php ./vendor/bin/phpunit -c ./phpunit.xml.dist --debug \
+                  --filter "$skip_regex" 2>&1 | tail -80
+          echo "full-main+Translation exit: $?"
+
+          wait "$WATCHDOG" 2>/dev/null
+
       - name: Run PHPUnit tests against Turso DB
         env:
           LD_PRELOAD: ${{ steps.preload.outputs.value }}
