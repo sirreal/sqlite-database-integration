@@ -551,7 +551,7 @@ jobs:
           new = (
               "\t\t\t$msg = $e->getMessage();\n"
               "\t\t\t// Normalise Turso-specific decoration to SQLite format.\n"
-              "\t\t\t$msg = preg_replace( '/(?<=: )Runtime error: /', '', $msg );\n"
+              "\t\t\t$msg = str_replace( 'Runtime error: ', '', $msg );\n"
               "\t\t\t$msg = preg_replace( '/ \\(19\\)$/', '', $msg );\n"
               "\t\t\tthrow $this->new_driver_exception( $msg, $e->getCode(), $e );"
           )
