@@ -543,7 +543,24 @@ jobs:
           open(path, 'w').write(src)
           print('patched PRAGMA foreign_key_check')
 
-          # 3. wp_die polyfill: real WordPress provides wp_die(); the unit-test
+          # 3. Turso prefixes constraint errors with "Runtime error: " which
+          #    SQLite doesn't. It also appends " (19)" (the SQLite error code)
+          #    to some messages. Tests compare against the SQLite format, so
+          #    strip Turso's extra decoration when rethrowing.
+          old = "\t\t\tthrow $this->new_driver_exception( $e->getMessage(), $e->getCode(), $e );"
+          new = (
+              "\t\t\t$msg = $e->getMessage();\n"
+              "\t\t\t// Normalise Turso-specific decoration to SQLite format.\n"
+              "\t\t\t$msg = preg_replace( '/(?<=: )Runtime error: /', '', $msg );\n"
+              "\t\t\t$msg = preg_replace( '/ \\(19\\)$/', '', $msg );\n"
+              "\t\t\tthrow $this->new_driver_exception( $msg, $e->getCode(), $e );"
+          )
+          assert old in src, 'rethrow block not found'
+          src = src.replace(old, new, 1)
+          open(path, 'w').write(src)
+          print('patched Turso error-message normalisation')
+
+          # 4. wp_die polyfill: real WordPress provides wp_die(); the unit-test
           # bootstrap doesn't, so tests hit an 'undefined function' error when
           # a driver error path tries to call it.
           path = 'tests/bootstrap.php'
