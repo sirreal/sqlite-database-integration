@@ -768,6 +768,13 @@ jobs:
                   $r = $pdo->query("SELECT fn_{$i}() AS v")->fetch(PDO::FETCH_ASSOC);
                   $log("[e.call {$i}] " . json_encode($r));
               }
+              // Test case-insensitive lookup: uppercase call on lowercase registration.
+              try {
+                  $r = $pdo->query("SELECT FN_32() AS v")->fetch(PDO::FETCH_ASSOC);
+                  $log('[e.upper 32] ' . json_encode($r));
+              } catch (\Throwable $ex) {
+                  $log('[e.upper 32] EXC: ' . $ex->getMessage());
+              }
           } catch (\Throwable $e) {
               $log('[e] EXC: ' . $e->getMessage());
           }
