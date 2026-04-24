@@ -896,109 +896,56 @@ jobs:
               -ex "bt 40" \
               --args "$(command -v php)" || true
 
-      - name: Probe testReconstructTable in isolation
-        continue-on-error: true
-        env:
-          LD_PRELOAD: ${{ steps.preload.outputs.value }}
-        working-directory: packages/mysql-on-sqlite
-        # Run just this one test by itself. Previous runs show it hangs at
-        # ~10 min when executed after the other tests. If it passes here in
-        # ~1 s, the hang is caused by accumulated process state from the
-        # preceding tests (likely leaked FuncSlot p_app refs).
-        run: |
-          set +e
-          timeout --kill-after=10 60 \
-              php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
-                  --filter '^WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable$'
-          echo "testReconstructTable isolated exit: $?"
-
-      - name: Probe testReconstructTable after Translation_Tests
-        continue-on-error: true
-        env:
-          LD_PRELOAD: ${{ steps.preload.outputs.value }}
-        working-directory: packages/mysql-on-sqlite
-        # Run Translation_Tests then testReconstructTable in one process.
-        # If this hangs, Translation_Tests specifically are leaving Turso in
-        # a bad state. If it passes, the trigger is something earlier.
-        run: |
-          set +e
-          timeout --kill-after=10 180 \
-              php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
-                  --filter '^(WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable)'
-          echo "Translation+reconstruct exit: $?"
-
-      - name: Probe Driver_Tests + Translation + testReconstructTable
-        continue-on-error: true
-        env:
-          LD_PRELOAD: ${{ steps.preload.outputs.value }}
-        working-directory: packages/mysql-on-sqlite
-        # Bisecting: is the pollution coming from WP_SQLite_Driver_Tests?
-        # Prints first-failure marker if testReconstructTable doesn't end.
-        run: |
-          set +e
-          timeout --kill-after=10 600 \
-              php ./vendor/bin/phpunit -c ./phpunit.xml.dist --debug \
-                  --filter '^(WP_SQLite_Driver_Tests|WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable$)' \
-              2>&1 | grep -E "(testReconstructTable|^Time:|^OK|FAILURES|^Tests:|^ERRORS|test.*started|test.*ended)" | tail -40
-          echo "Driver+Translation+reconstruct exit: $?"
-
-      - name: Probe Metadata_Tests + Translation + testReconstructTable
-        continue-on-error: true
-        env:
-          LD_PRELOAD: ${{ steps.preload.outputs.value }}
-        working-directory: packages/mysql-on-sqlite
-        # Bisecting: is the pollution coming from Metadata_Tests?
-        run: |
-          set +e
-          timeout --kill-after=10 300 \
-              php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
-                  --filter '^(WP_SQLite_Driver_Metadata_Tests|WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable$)'
-          echo "Metadata+Translation+reconstruct exit: $?"
-
-      - name: Probe PDO_API + Translation + testReconstructTable
-        continue-on-error: true
-        env:
-          LD_PRELOAD: ${{ steps.preload.outputs.value }}
-        working-directory: packages/mysql-on-sqlite
-        # Bisecting: is the pollution coming from PDO_API_Tests?
-        run: |
-          set +e
-          timeout --kill-after=10 300 \
-              php ./vendor/bin/phpunit -c ./phpunit.xml.dist \
-                  --filter '^(WP_PDO_MySQL_On_SQLite_PDO_API_Tests|WP_SQLite_Driver_Translation_Tests|WP_SQLite_Information_Schema_Reconstructor_Tests::testReconstructTable$)'
-          echo "PDO_API+Translation+reconstruct exit: $?"
-
       - name: Probe full main run with Translation unskipped + gdb watchdog
         continue-on-error: true
         env:
           LD_PRELOAD: ${{ steps.preload.outputs.value }}
         working-directory: packages/mysql-on-sqlite
-        # Reproduce the 4c4f491 main-run state (Translation_Tests unskipped).
-        # Previous runs hang here at testReconstructTable for 10 min; install a
-        # watchdog that snapshots the PHP process with gdb before killing it.
+        # Reproduce the 4c4f491 main-run state (Translation_Tests unskipped)
+        # and capture what PHP is actually doing during the hang.
+        #
+        # Timeline budget (~7 min total):
+        #   0-30s: build testcases, run PDO_API + Driver_Tests (fast, ~5k tests)
+        #   30-60s: Metadata_Tests + Translation_Tests (completed at 60s in 45)
+        #   60s: testReconstructTable starts and hangs
+        #   360s: first gdb snapshot (5 min in)
+        #   400s: second gdb snapshot (in case first detached/crashed)
+        #   420s: timeout kills php
         run: |
           set +e
           skip_regex='^(?!WP_MySQL_Server_Suite_).+'
 
-          # Watchdog: after 150s, grab a backtrace of the hanging PHP.
-          (
-            sleep 150
-            PHP_PID=$(pgrep -f 'phpunit.*--filter' | head -1)
-            if [ -n "$PHP_PID" ]; then
-              echo "=== watchdog: attaching gdb to php pid $PHP_PID ==="
-              sudo gdb -p "$PHP_PID" -batch \
-                -ex 'set pagination off' \
-                -ex 'info threads' \
-                -ex 'thread apply all bt 40' \
-                2>&1 | head -400
-              echo "=== watchdog: done ==="
-            else
-              echo "=== watchdog: no php pid found ==="
+          dump_backtraces() {
+            local label=$1
+            # Target the PHP process (not the timeout wrapper). Use exact name.
+            local PHP_PID
+            PHP_PID=$(pgrep -x php | head -1)
+            if [ -z "$PHP_PID" ]; then
+              echo "=== watchdog ($label): no php pid found ==="
+              return
             fi
+            echo "=== watchdog ($label): attaching gdb to php pid $PHP_PID ==="
+            # /proc/PID/stack shows what the kernel thinks PHP is waiting for
+            # — free even without ptrace and cheap to read.
+            echo "--- /proc/$PHP_PID/wchan: $(cat /proc/$PHP_PID/wchan 2>/dev/null) ---"
+            echo "--- /proc/$PHP_PID/stack ---"
+            sudo cat /proc/$PHP_PID/stack 2>/dev/null | head -30
+            echo "--- gdb bt ---"
+            sudo gdb -p "$PHP_PID" -batch \
+              -ex 'set pagination off' \
+              -ex 'info threads' \
+              -ex 'thread apply all bt 40' \
+              2>&1 | head -400
+            echo "=== watchdog ($label): done ==="
+          }
+
+          (
+            sleep 360 && dump_backtraces "T+360s"
+            sleep 40 && dump_backtraces "T+400s"
           ) &
           WATCHDOG=$!
 
-          timeout --kill-after=10 180 \
+          timeout --kill-after=10 420 \
               php ./vendor/bin/phpunit -c ./phpunit.xml.dist --debug \
                   --filter "$skip_regex" 2>&1 | tail -80
           echo "full-main+Translation exit: $?"
