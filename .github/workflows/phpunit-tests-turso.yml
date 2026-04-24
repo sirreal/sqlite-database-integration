@@ -1132,6 +1132,7 @@ jobs:
 
           # 13. Update Translation_Tests expectations to match the new
           #     SELECT-AS-columnN form emitted by insertFromConstructor.
+          import re
           path = 'tests/WP_SQLite_Driver_Translation_Tests.php'
           src = open(path).read()
           # Match `FROM (VALUES ( v1 [, v2 ...] ) [, ( ... ) ...])`
