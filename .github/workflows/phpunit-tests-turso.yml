@@ -451,7 +451,81 @@ jobs:
         working-directory: packages/mysql-on-sqlite
         run: |
           python3 - <<'PY'
-          # wp_die polyfill: real WordPress provides wp_die(); the unit-test
+          # 1. Turso's UPDATE parser doesn't accept row-value assignment from
+          #    a subquery ("SET (a, b) = (SELECT ...)") — 82 tests fail with
+          #    "2 columns assigned 1 values". Rewrite sync_column_key_info's
+          #    single UPDATE into two correlated subqueries, one per column.
+          path = 'src/sqlite/class-wp-sqlite-information-schema-builder.php'
+          src = open(path).read()
+          old = (
+              "\t\t$this->connection->query(\n"
+              "\t\t\t'\n"
+              "\t\t\t\tUPDATE ' . $this->connection->quote_identifier( $columns_table_name ) . \" AS c\n"
+              "\t\t\t\tSET (column_key, is_nullable) = (\n"
+              "\t\t\t\t\tSELECT\n"
+              "\t\t\t\t\t\tCASE\n"
+              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'PRI'\n"
+              "\t\t\t\t\t\t\tWHEN MAX(s.non_unique = 0 AND s.seq_in_index = 1) THEN 'UNI'\n"
+              "\t\t\t\t\t\t\tWHEN MAX(s.seq_in_index = 1) THEN 'MUL'\n"
+              "\t\t\t\t\t\t\tELSE ''\n"
+              "\t\t\t\t\t\tEND,\n"
+              "\t\t\t\t\t\tCASE\n"
+              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'NO'\n"
+              "\t\t\t\t\t\t\tELSE c.is_nullable\n"
+              "\t\t\t\t\t\tEND\n"
+              "\t\t\t\t\tFROM \" . $this->connection->quote_identifier( $statistics_table_name ) . ' AS s\n"
+              "\t\t\t\t\tWHERE s.table_schema = c.table_schema\n"
+              "\t\t\t\t\tAND s.table_name = c.table_name\n"
+              "\t\t\t\t\tAND s.column_name = c.column_name\n"
+              "\t\t\t\t)\n"
+              "\t\t\t    WHERE c.table_schema = ?\n"
+              "\t\t\t    AND c.table_name = ?\n"
+              "\t\t\t',\n"
+              "\t\t\tarray( self::SAVED_DATABASE_NAME, $table_name )\n"
+              "\t\t);"
+          )
+          assert old in src, 'sync_column_key_info UPDATE not found'
+          new = "\n".join([
+              "\t\t$columns_table    = $this->connection->quote_identifier( $columns_table_name );",
+              "\t\t$statistics_table = $this->connection->quote_identifier( $statistics_table_name );",
+              "\t\t$this->connection->query(",
+              "\t\t\t\"",
+              "\t\t\t\tUPDATE $columns_table AS c",
+              "\t\t\t\tSET column_key = (",
+              "\t\t\t\t\tSELECT",
+              "\t\t\t\t\t\tCASE",
+              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'PRI'",
+              "\t\t\t\t\t\t\tWHEN MAX(s.non_unique = 0 AND s.seq_in_index = 1) THEN 'UNI'",
+              "\t\t\t\t\t\t\tWHEN MAX(s.seq_in_index = 1) THEN 'MUL'",
+              "\t\t\t\t\t\t\tELSE ''",
+              "\t\t\t\t\t\tEND",
+              "\t\t\t\t\tFROM $statistics_table AS s",
+              "\t\t\t\t\tWHERE s.table_schema = c.table_schema",
+              "\t\t\t\t\tAND s.table_name = c.table_name",
+              "\t\t\t\t\tAND s.column_name = c.column_name",
+              "\t\t\t\t),",
+              "\t\t\t\tis_nullable = (",
+              "\t\t\t\t\tSELECT",
+              "\t\t\t\t\t\tCASE",
+              "\t\t\t\t\t\t\tWHEN MAX(s.index_name = 'PRIMARY') THEN 'NO'",
+              "\t\t\t\t\t\t\tELSE c.is_nullable",
+              "\t\t\t\t\t\tEND",
+              "\t\t\t\t\tFROM $statistics_table AS s",
+              "\t\t\t\t\tWHERE s.table_schema = c.table_schema",
+              "\t\t\t\t\tAND s.table_name = c.table_name",
+              "\t\t\t\t\tAND s.column_name = c.column_name",
+              "\t\t\t\t)",
+              "\t\t\t\tWHERE c.table_schema = ?",
+              "\t\t\t\tAND c.table_name = ?",
+              "\t\t\t\",",
+              "\t\t\tarray( self::SAVED_DATABASE_NAME, $table_name )",
+              "\t\t);",
+          ])
+          src = src.replace(old, new, 1)
+          open(path, 'w').write(src)
+          print('patched sync_column_key_info UPDATE')
+
+          # 2. wp_die polyfill: real WordPress provides wp_die(); the unit-test
           # bootstrap doesn't, so tests hit an 'undefined function' error when
           # a driver error path tries to call it.
           path = 'tests/bootstrap.php'
