@@ -32,7 +32,7 @@ jobs:
           path: doltlite-src
 
       - name: Patch Doltlite for mysql-on-sqlite compatibility
-        # Narrow, verifiable source-level patches applied before build:
+        # Four narrow, verifiable source-level patches applied before build:
         #
         # 1) src/build.c — neutralize the auto-conversion of composite/TEXT-PK
         #    tables to WITHOUT ROWID, so the driver's `ORDER BY ROWID`
@@ -55,6 +55,13 @@ jobs:
         #    entry check the mutmap for a DELETE on that tree key; if
         #    found, skip and advance. Without this, INSERT+DELETE+UPDATE
         #    in one transaction trips "database disk image is malformed".
+        #
+        # 4) src/prolly_btree.c — preserve the original record bytes as
+        #    the index value when any pKeyInfo collation is lossy
+        #    (NOCASE, RTRIM). Without this, auto-index covering reads
+        #    reconstruct a SQLite record from the sort key and return
+        #    folded bytes (e.g. 'johnny' instead of 'Johnny') for plain
+        #    column reads on composite-PK rowid tables.
         run: |
           BUILD=doltlite-src/src/build.c
           MOVETO=doltlite-src/src/prolly_btree.c
@@ -74,8 +81,12 @@ jobs:
           patch -d doltlite-src -p1 --no-backup-if-mismatch \
             < .github/doltlite-patches/mergeScan-check-tree-delete.patch
 
+          # --- Patch 4: preserve original record bytes on lossy-collation index entries ---
+          patch -d doltlite-src -p1 --no-backup-if-mismatch \
+            < .github/doltlite-patches/preserve-original-value-when-sortkey-lossy.patch
+
           echo "--- Patched lines ---"
-          grep -n 'patched off in CI\|savedEqSeen\|walked past' "$BUILD" "$MOVETO"
+          grep -n 'patched off in CI\|savedEqSeen\|walked past\|lossy = 1' "$BUILD" "$MOVETO"
 
       - name: Build Doltlite shared library
         run: |
@@ -120,7 +131,7 @@ jobs:
           echo "ldd pdo_sqlite:"
           ldd "$(php -r 'echo ini_get("extension_dir");')/pdo_sqlite.so"
 
-      - name: Verify Doltlite is active and patches took effect
+      - name: Verify Doltlite is active and both patches took effect
         run: |
           VERSION=$(php -r 'echo (new PDO("sqlite::memory:"))->query("SELECT SQLITE_VERSION()")->fetch()[0];')
           ENGINE=$(php -r 'echo (new PDO("sqlite::memory:"))->query("SELECT doltlite_engine()")->fetch()[0];')
@@ -181,6 +192,20 @@ jobs:
           echo "post-UPDATE value = ${VAL}"
           if [ "${VAL}" != "x" ]; then
             echo "::error::mergeScan patch did not take effect: expected 'x', got '${VAL}'"
+            exit 1
+          fi
+          # 4) lossy-collation patch: a covering-index read on a
+          # composite-PK rowid table with a NOCASE text column no
+          # longer returns folded bytes.
+          NAME=$(php -r '
+            $db = new PDO("sqlite::memory:");
+            $db->exec("CREATE TABLE t (id INT, pkcol TEXT COLLATE NOCASE, extra TEXT, PRIMARY KEY (id, pkcol))");
+            $db->exec("INSERT INTO t VALUES (1, \"Johnny\", \"x\")");
+            echo $db->query("SELECT pkcol FROM t")->fetch()[0];
+          ' 2>&1)
+          echo "covering-index pkcol = ${NAME}"
+          if [ "${NAME}" != "Johnny" ]; then
+            echo "::error::lossy-collation patch did not take effect: expected 'Johnny', got '${NAME}'"
             exit 1
           fi
 
